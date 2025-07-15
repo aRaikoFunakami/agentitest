@@ -80,15 +80,24 @@ For more information on how to use Allure with pytest, see the [official Allure 
 
 3. **Set Up Environment Variables**:
 
-    You can configure the framework by setting [environment variables](https://docs.browser-use.com/development/local-setup#configuration) directly in your shell or by creating a `.env` file in the project root.
+    To get started, create a `.env` file in the root of the project by copying the provided template:
+
+    ```bash
+    cp .env.example .env
+    ```
+
+    Next, open the `.env` file and add your `GOOGLE_API_KEY`. This file is pre-configured with sensible defaults, but you can customize them to fit your needs.
 
     **Required Variables**:
-    * `GEMINI_MODEL`: The specific Gemini model you want to use (e.g., `gemini-2.5-pro`). For a list of available models, see the [Gemini models documentation](https://ai.google.dev/gemini-api/docs/models).
     * `GOOGLE_API_KEY`: Your Google API key for accessing the Gemini model.
+
+    **Optional Variables**:
+    * `GEMINI_MODEL`: The specific Gemini model you want to use (e.g., `gemini-2.5-pro`). For a list of available models, see the [Gemini models documentation](https://ai.google.dev/gemini-api/docs/models).
+    * `HEADLESS`: Set to `true` to run in headless mode (without a visible browser UI) or `false` to run with a visible UI.
 
 ## 🧪 Running the Tests
 
-To run the tests and generate the Allure report data, use the following command:
+Once your environment is configured, you can run the tests and generate the Allure report data with a single command:
 
 ```bash
 pytest
