@@ -60,7 +60,11 @@ class TestSearch(BaseAgentTest):
     @pytest.mark.parametrize("term", ["BigQuery", "Vertex AI"])
     async def test_search_for_term(self, llm, browser_session, term):
         """Tests searching for a term and verifying results are shown."""
-        task = f"find the search bar, type '{term}', press enter, and then return the final URL."
+        task = (
+        f"find the search bar, type '{term}', wait for the suggestions to appear, "
+        "then press Enter again to submit the search (or click the search icon), "
+        "and return the final URL."
+        )
         expected_url_part = f"search?q={quote(term)}"
         await self.validate_task(llm, browser_session, task, expected_url_part)
 
