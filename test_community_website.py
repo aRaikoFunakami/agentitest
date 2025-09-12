@@ -18,10 +18,10 @@ class TestHomePageStats(BaseAgentTest):
     @pytest.mark.parametrize(
         "link_text, expected_path_segment",
         [
-            ("Google Workspace", "google-workspace"),
+            ("Google Cloud", "google-cloud"),
+            ("Looker", "looker"),
+            ("Google Workspace Developers", "google-workspace"),
             ("AppSheet", "appsheet"),
-            ("Looker & Looker Studio", "looker"),
-            ("Google Cloud Security", "security"),
         ],
     )
     async def test_main_navigation(
@@ -38,6 +38,7 @@ class TestHomePageStats(BaseAgentTest):
 
     @allure.story("Community Statistics")
     @allure.title("Test Visibility of Community Stats")
+    @pytest.mark.skip(reason="Legacy community stats (Members/Online/Solutions) were removed on the new discuss.google.dev site")
     @pytest.mark.asyncio
     async def test_stats_are_visible(self, llm, browser_session):
         """Tests that the Members, Online, and Solutions stats are visible on the page."""
@@ -60,7 +61,7 @@ class TestSearch(BaseAgentTest):
     async def test_search_for_term(self, llm, browser_session, term):
         """Tests searching for a term and verifying results are shown."""
         task = f"find the search bar, type '{term}', press enter, and then return the final URL."
-        expected_url_part = f"q={quote(term)}"
+        expected_url_part = f"search?q={quote(term)}"
         await self.validate_task(llm, browser_session, task, expected_url_part)
 
     @allure.story("Searching for Non-Existent Term")
