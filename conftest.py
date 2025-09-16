@@ -173,10 +173,11 @@ async def _capture_failure_context(agent, test_name: str):
 
 async def _capture_mobile_screenshot(agent, context: str):
     """
-    Mobile-MCPツールから直接スクリーンショットを取得してAllureに添付
+    Mobile-MCPのmobile_save_screenshotツールから直接スクリーンショットを取得してAllureに添付
     
-    conftest_web.pyのscreenshot_b64 = await agent.browser_session.take_screenshot()と同等の
-    直接ツール呼び出し機能をMobile-MCP版で実装
+    mobile_take_screenshotからmobile_save_screenshotに変更:
+    - mobile_save_screenshotはファイルパスを返すため、ファイルを読み込んでAllureに添付
+    - より安定したスクリーンショット取得機能を提供
     
     Args:
         agent: AndroidBaseAgentTestインスタンス
@@ -195,126 +196,104 @@ async def _capture_mobile_screenshot(agent, context: str):
         mobile_tools = await agent.mcp_client.get_tools()
         screenshot_tool = None
         
-        # mobile_take_screenshotツールを検索
+        # mobile_save_screenshotツールを検索
         for tool in mobile_tools:
-            if hasattr(tool, 'name') and tool.name == 'mobile_take_screenshot':
+            if hasattr(tool, 'name') and tool.name == 'mobile_save_screenshot':
                 screenshot_tool = tool
                 break
         
         if not screenshot_tool:
             allure.attach(
-                "mobile_take_screenshot tool not found in available tools",
+                "mobile_save_screenshot tool not found in available tools",
                 name=f"Screenshot Tool Error - {context}",
                 attachment_type=allure.attachment_type.TEXT,
             )
             return
             
-        # device パラメータを使ってスクリーンショットを取得
+        # device パラメータを使ってスクリーンショットを保存
         device_id = agent._current_device_id or "emulator-5554"
-        screenshot_result = await screenshot_tool.ainvoke({"device": device_id})
+        
+        # 一時ファイルパスを生成
+        import tempfile
+        import time
+        temp_dir = tempfile.gettempdir()
+        screenshot_filename = f"conftest_screenshot_{int(time.time())}.png"
+        screenshot_path = os.path.join(temp_dir, screenshot_filename)
+        
+        # mobile_save_screenshotはファイルパスを返す（タイムアウト保護付き）
+        screenshot_result = await asyncio.wait_for(
+            screenshot_tool.ainvoke({
+                "device": device_id,
+                "saveTo": screenshot_path
+            }),
+            timeout=15.0  # 15秒のタイムアウト
+        )
         
         # デバッグ: screenshot_resultの内容をログ出力
-        print(f"DEBUG: screenshot_result type: {type(screenshot_result)}")
-        print(f"DEBUG: screenshot_result length: {len(screenshot_result) if isinstance(screenshot_result, str) else 'N/A'}")
-        print(f"DEBUG: screenshot_result content preview: {repr(screenshot_result[:200]) if isinstance(screenshot_result, str) else screenshot_result}")
-        if hasattr(screenshot_result, 'content'):
-            print(f"DEBUG: content type: {type(screenshot_result.content)}")
-            print(f"DEBUG: content: {screenshot_result.content}")
+        print(f"DEBUG conftest: screenshot_result type: {type(screenshot_result)}")
+        print(f"DEBUG conftest: screenshot_result: {screenshot_result}")
+        print(f"DEBUG conftest: screenshot_path: {screenshot_path}")
         
-        # mobile-mcpツールの戻り値は直接Base64文字列の可能性がある
-        if isinstance(screenshot_result, str) and screenshot_result:
+        # mobile_save_screenshotの結果は保存が成功したことを示す
+        # 実際のファイルパスはscreenshot_pathに指定したパス
+        # mobile_save_screenshotの結果は保存が成功したことを示す
+        # 実際のファイルパスはscreenshot_pathに指定したパス
+        if os.path.exists(screenshot_path):
             try:
-                # Base64文字列として直接処理を試行
-                import base64
-                screenshot_bytes = base64.b64decode(screenshot_result)
+                # ファイルを読み込んでAllureに添付
+                with open(screenshot_path, 'rb') as f:
+                    screenshot_bytes = f.read()
                 
-                # 画像データかどうか確認（JPEGまたはPNGヘッダーをチェック）
-                if screenshot_bytes.startswith(b'\xff\xd8\xff'):
-                    # JPEG画像
-                    allure.attach(
-                        screenshot_bytes,
-                        name=f"Screenshot - {context}",
-                        attachment_type=allure.attachment_type.JPG
-                    )
-                    return
-                elif screenshot_bytes.startswith(b'\x89PNG'):
-                    # PNG画像
-                    allure.attach(
-                        screenshot_bytes,
-                        name=f"Screenshot - {context}",
-                        attachment_type=allure.attachment_type.PNG
-                    )
-                    return
+                # ファイル拡張子から画像形式を判定
+                if screenshot_path.lower().endswith('.jpg') or screenshot_path.lower().endswith('.jpeg'):
+                    attachment_type = allure.attachment_type.JPG
+                elif screenshot_path.lower().endswith('.png'):
+                    attachment_type = allure.attachment_type.PNG
                 else:
-                    allure.attach(
-                        f"Invalid image data (first 20 bytes): {screenshot_bytes[:20]}",
-                        name=f"Screenshot Invalid Data - {context}",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-                    return
+                    # ファイルヘッダーから判定
+                    if screenshot_bytes.startswith(b'\xff\xd8\xff'):
+                        attachment_type = allure.attachment_type.JPG
+                    elif screenshot_bytes.startswith(b'\x89PNG'):
+                        attachment_type = allure.attachment_type.PNG
+                    else:
+                        attachment_type = allure.attachment_type.PNG  # デフォルト
+                
+                allure.attach(
+                    screenshot_bytes,
+                    name=f"Screenshot - {context}",
+                    attachment_type=attachment_type
+                )
+                print(f"DEBUG conftest: スクリーンショットをAllureに添付完了: {screenshot_path}")
+                
+                # 一時ファイルを削除
+                try:
+                    os.remove(screenshot_path)
+                except Exception:
+                    pass  # 削除失敗は無視
+                
+                return
                     
             except Exception as e:
                 allure.attach(
-                    f"Failed to decode base64: {str(e)}",
-                    name=f"Screenshot Decode Error - {context}",
+                    f"Failed to read screenshot file: {str(e)}",
+                    name=f"Screenshot File Read Error - {context}",
                     attachment_type=allure.attachment_type.TEXT
                 )
                 return
-        
-        # mobile-mcpのレスポンス構造に基づく処理
-        if screenshot_result and hasattr(screenshot_result, 'content'):
-            content = screenshot_result.content
-            
-            # mobile-mcpは content: [{ type: "image", data: base64_string, mimeType: "image/png" }] を返す
-            if isinstance(content, list) and len(content) > 0:
-                image_content = content[0]
-                if isinstance(image_content, dict) and image_content.get('type') == 'image':
-                    screenshot_data = image_content.get('data')
-                    mime_type = image_content.get('mimeType', 'image/png')
-                    
-                    if screenshot_data:
-                        # Base64デコード
-                        import base64
-                        screenshot_bytes = base64.b64decode(screenshot_data)
-                        
-                        # MIMEタイプに基づいてAllure添付タイプを決定
-                        if mime_type == 'image/jpeg':
-                            attachment_type = allure.attachment_type.JPG
-                        else:
-                            attachment_type = allure.attachment_type.PNG
-                        
-                        allure.attach(
-                            screenshot_bytes,
-                            name=f"Screenshot - {context}",
-                            attachment_type=attachment_type
-                        )
-                        return
-                        
-                    else:
-                        allure.attach(
-                            f"No image data in content: {image_content}",
-                            name=f"Screenshot No Data - {context}",
-                            attachment_type=allure.attachment_type.TEXT
-                        )
-                else:
-                    allure.attach(
-                        f"Unexpected content format: {content}",
-                        name=f"Screenshot Format Error - {context}",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-            else:
-                allure.attach(
-                    f"Content is not a list or empty: {content}",
-                    name=f"Screenshot Content Error - {context}",
-                    attachment_type=allure.attachment_type.TEXT
-                )
         else:
             allure.attach(
-                f"No content in response: {screenshot_result}",
-                name=f"Screenshot Response Error - {context}",
+                f"Screenshot file not found at: {screenshot_path}",
+                name=f"Screenshot File Error - {context}",
                 attachment_type=allure.attachment_type.TEXT
             )
+            return
                         
+    except asyncio.TimeoutError:
+        allure.attach(
+            f"Screenshot capture timed out after 15 seconds",
+            name=f"Screenshot Timeout - {context}",
+            attachment_type=allure.attachment_type.TEXT
+        )
     except Exception as e:
         allure.attach(
             f"Failed to capture mobile screenshot: {str(e)}",
