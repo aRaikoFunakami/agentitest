@@ -1,0 +1,18 @@
+[project]
+name = "agentitest"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "allure-pytest>=2.15.0",
+    "browser-use>=0.7.7",
+    "langchain>=0.3.27",
+    "langchain-mcp-adapters>=0.1.9",
+    "langchain-openai>=0.3.33",
+    "langgraph>=0.6.7",
+    "openai>=1.107.3",
+    "playwright>=1.55.0",
+    "pytest-asyncio>=1.2.0",
+    "python-dotenv>=1.1.1",
+]
