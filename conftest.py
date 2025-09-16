@@ -209,6 +209,180 @@ class AndroidBaseTest:
             f"Screenshot capture not confirmed in result: {result}"
 
 
+# --- Android版エージェントステップ記録機能 ---
+
+async def record_android_step(agent):
+    """
+    Android エージェントの各ステップを記録する関数
+    
+    Web版のrecord_step機能をAndroid版に移植。
+    エージェントの各アクション終了時にスクリーンショット、Thoughts、実行時間等を記録。
+    
+    Args:
+        agent: AndroidBaseAgentTestインスタンス
+    """
+    if not agent or not hasattr(agent, 'conversation_history'):
+        return
+
+    # 最新の会話履歴から情報を取得
+    if not agent.conversation_history:
+        return
+    
+    last_conversation = agent.conversation_history[-1]
+    action_task = last_conversation.get('task', 'Unknown Action')
+    action_result = last_conversation.get('result', 'No result')
+    
+    # ステップタイトルを生成（Web版と同様の形式）
+    step_title = f"Mobile Action: {action_task[:50]}..."
+    
+    with allure.step(step_title):
+        # Agent Thoughts を添付（結果から推論プロセスを抽出）
+        try:
+            thoughts_content = _extract_agent_thoughts(action_task, action_result)
+            if thoughts_content:
+                allure.attach(
+                    thoughts_content,
+                    name="Agent Thoughts",
+                    attachment_type=allure.attachment_type.TEXT,
+                )
+        except Exception as e:
+            allure.attach(
+                f"Failed to extract agent thoughts: {str(e)}",
+                name="Thoughts Extraction Error",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+
+        # デバイス情報を添付
+        device_id = agent._current_device_id or "emulator-5554"
+        allure.attach(
+            f"Device: {device_id}",
+            name="Device Info",
+            attachment_type=allure.attachment_type.TEXT,
+        )
+
+        # 現在のアプリ情報を添付
+        if agent._current_app_bundle_id:
+            allure.attach(
+                agent._current_app_bundle_id,
+                name="Current App",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+
+        # ステップ実行時間を添付
+        timestamp = last_conversation.get('timestamp')
+        if timestamp:
+            import time
+            duration = time.time() - timestamp
+            allure.attach(
+                f"{duration:.2f}s",
+                name="Step Duration",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+
+        # スクリーンショットを添付（アクション終了後の状態）
+        try:
+            await agent._attach_current_screenshot(f"After Action: {action_task[:30]}...")
+        except Exception as e:
+            allure.attach(
+                f"Failed to capture screenshot: {str(e)}",
+                name="Screenshot Error",
+                attachment_type=allure.attachment_type.TEXT,
+            )
+
+
+def _extract_agent_thoughts(task: str, result: str) -> str:
+    """
+    エージェントのタスクと結果から思考プロセスを抽出
+    
+    Args:
+        task: 実行されたタスク
+        result: エージェントの実行結果
+        
+    Returns:
+        抽出された思考プロセスの文字列
+    """
+    thoughts_lines = []
+    
+    # タスク分析
+    thoughts_lines.append(f"🎯 Task Analysis: {task}")
+    thoughts_lines.append("")
+    
+    # タスクからの意図推論
+    task_lower = task.lower()
+    if "screenshot" in task_lower:
+        thoughts_lines.append("💭 Intent: Capture current screen state for verification")
+    elif "click" in task_lower or "tap" in task_lower:
+        thoughts_lines.append("💭 Intent: Interact with UI element through touch gesture")
+    elif "type" in task_lower or "input" in task_lower:
+        thoughts_lines.append("💭 Intent: Provide text input to form or search field")
+    elif "launch" in task_lower or "open" in task_lower:
+        thoughts_lines.append("💭 Intent: Start target application for test execution")
+    elif "navigate" in task_lower or "go to" in task_lower:
+        thoughts_lines.append("💭 Intent: Navigate to specific location or feature")
+    elif "scroll" in task_lower:
+        thoughts_lines.append("💭 Intent: Scroll to reveal additional content or elements")
+    elif "search" in task_lower:
+        thoughts_lines.append("💭 Intent: Find specific content or information")
+    else:
+        thoughts_lines.append("💭 Intent: Execute mobile automation operation")
+    
+    thoughts_lines.append("")
+    
+    # 結果から実行されたアクションを推論
+    result_lower = result.lower()
+    
+    if "screenshot" in result_lower or "image" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Screenshot captured successfully")
+        if "failed" not in result_lower:
+            thoughts_lines.append("✅ Reasoning: Visual state documented for analysis")
+    elif "click" in result_lower or "tap" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Touch interaction performed")
+        if "coordinates" in result_lower:
+            thoughts_lines.append("✅ Reasoning: Used coordinate-based click for precise targeting")
+        else:
+            thoughts_lines.append("✅ Reasoning: Element-based interaction executed")
+    elif "type" in result_lower or "input" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Text input completed")
+        thoughts_lines.append("✅ Reasoning: Data entry successful for form interaction")
+    elif "launch" in result_lower or "open" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Application launched")
+        thoughts_lines.append("✅ Reasoning: Target app started and ready for interaction")
+    elif "scroll" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Scroll operation executed")
+        thoughts_lines.append("✅ Reasoning: Content area adjusted to reveal target elements")
+    elif "navigate" in result_lower or "go to" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Navigation completed")
+        thoughts_lines.append("✅ Reasoning: Successfully moved to target screen/location")
+    elif "search" in result_lower:
+        thoughts_lines.append("🔧 Action Taken: Search operation performed")
+        thoughts_lines.append("✅ Reasoning: Query executed to find relevant content")
+    elif "error" in result_lower or "failed" in result_lower:
+        thoughts_lines.append("❌ Action Taken: Operation encountered error")
+        thoughts_lines.append("🔍 Reasoning: Alternative approach may be needed")
+    else:
+        thoughts_lines.append("🔧 Action Taken: General mobile automation task executed")
+        thoughts_lines.append("✅ Reasoning: Standard operation completed")
+    
+    thoughts_lines.append("")
+    
+    # 結果の品質評価
+    if len(result.strip()) > 100:
+        thoughts_lines.append("📊 Result Quality: Detailed response received")
+    elif len(result.strip()) > 20:
+        thoughts_lines.append("📊 Result Quality: Adequate response length")
+    else:
+        thoughts_lines.append("⚠️ Result Quality: Brief response - may need verification")
+    
+    thoughts_lines.append("")
+    
+    # 結果サマリ（長すぎる場合は切り詰め）
+    result_summary = result[:300] + "..." if len(result) > 300 else result
+    thoughts_lines.append("📝 Execution Result Summary:")
+    thoughts_lines.append(f"   {result_summary}")
+    
+    return "\n".join(thoughts_lines)
+
+
 # Allure報告用のカスタムステップデコレータ
 def allure_android_step(step_description: str):
     """

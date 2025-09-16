@@ -388,6 +388,7 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
         """
         with allure.step(f"Agent execution: {task}"):
             start_time = time.time()
+            self._current_task_start_time = start_time  # タスク開始時間を記録
             
             try:
                 # タスク実行前のスクリーンショット取得
@@ -428,6 +429,26 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
                 
                 # エージェント状態を更新
                 self._update_agent_state(task, result)
+                
+                # --- 各アクション終了時の自動記録 ---
+                try:
+                    # conftest.pyのrecord_android_step関数を呼び出し
+                    from conftest import record_android_step
+                    await record_android_step(self)
+                except ImportError:
+                    # conftest.pyがインポートできない場合のフォールバック
+                    allure.attach(
+                        "record_android_step function not available",
+                        name="Step Recording Warning",
+                        attachment_type=allure.attachment_type.TEXT
+                    )
+                except Exception as step_recording_error:
+                    # ステップ記録エラーは警告レベルで処理（メインタスクの失敗にしない）
+                    allure.attach(
+                        f"Failed to record step: {str(step_recording_error)}",
+                        name="Step Recording Error",
+                        attachment_type=allure.attachment_type.TEXT
+                    )
                 
                 # パフォーマンス警告
                 if duration > 60:
@@ -803,7 +824,8 @@ def _add_state_management_methods():
         self.conversation_history.append({
             "task": task,
             "result": result,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "start_time": getattr(self, '_current_task_start_time', time.time())  # タスク開始時間
         })
         
         # 履歴が長くなりすぎないよう制限（最新10件まで）
