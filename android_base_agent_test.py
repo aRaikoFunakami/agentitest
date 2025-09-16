@@ -96,10 +96,21 @@ class AndroidBaseAgentTest:
         
         # キャッシュが無効な場合のみデバイス検索を実行
         try:
-            devices_result = await self.mcp_client.call_tool(
-                "mobile_list_available_devices",
-                arguments={}
-            )
+            # MCPツールを取得して直接呼び出し
+            mobile_tools = await self.mcp_client.get_tools()
+            devices_tool = None
+            
+            # mobile_list_available_devicesツールを検索
+            for tool in mobile_tools:
+                if hasattr(tool, 'name') and tool.name == 'mobile_list_available_devices':
+                    devices_tool = tool
+                    break
+            
+            if not devices_tool:
+                print("mobile_list_available_devices tool not found")
+                return "emulator-5554"  # デフォルト値を返す
+                
+            devices_result = await devices_tool.ainvoke({})
             
             if devices_result and hasattr(devices_result, 'content'):
                 content = devices_result.content
@@ -334,14 +345,23 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
             device_id = self._current_device_id or "emulator-5554"
             
             try:
-                # 直接mobile-mcpツールを呼び出し（エージェント推論をスキップ）
-                result = await self.mcp_client.call_tool(
-                    "mobile_launch_app",
-                    arguments={
-                        "device": device_id,
-                        "packageName": app_bundle_id
-                    }
-                )
+                # MCPツールを取得して直接呼び出し
+                mobile_tools = await self.mcp_client.get_tools()
+                launch_tool = None
+                
+                # mobile_launch_appツールを検索
+                for tool in mobile_tools:
+                    if hasattr(tool, 'name') and tool.name == 'mobile_launch_app':
+                        launch_tool = tool
+                        break
+                
+                if not launch_tool:
+                    raise RuntimeError("mobile_launch_app tool not found")
+                    
+                result = await launch_tool.ainvoke({
+                    "device": device_id,
+                    "packageName": app_bundle_id
+                })
                 
                 # 結果を処理
                 if result and hasattr(result, 'content'):
@@ -580,13 +600,24 @@ Execute all mobile_* tool calls with device parameter set to "{device_id}".
                 )
                 return
             
-            # mobile-mcpの直接呼び出しでスクリーンショットを取得
+            # Mobile-MCPツールを取得して直接呼び出し（LLMを経由せず）
             try:
-                # mobile_take_screenshotツールを直接呼び出し
-                screenshot_result = await self.mcp_client.call_tool(
-                    "mobile_take_screenshot",
-                    arguments={"device": self._current_device_id or "emulator-5554"}
-                )
+                # MCPツールを取得
+                mobile_tools = await self.mcp_client.get_tools()
+                screenshot_tool = None
+                
+                # mobile_take_screenshotツールを検索
+                for tool in mobile_tools:
+                    if hasattr(tool, 'name') and tool.name == 'mobile_take_screenshot':
+                        screenshot_tool = tool
+                        break
+                
+                if not screenshot_tool:
+                    raise RuntimeError("mobile_take_screenshot tool not found")
+                    
+                screenshot_result = await screenshot_tool.ainvoke({
+                    "device": self._current_device_id or "emulator-5554"
+                })
                 
                 # mobile-mcpのレスポンス構造に基づく処理
                 screenshot_data = None
