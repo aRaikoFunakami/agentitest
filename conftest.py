@@ -1,60 +1,28 @@
-import base64
+"""
+Android版conftest.py
+
+Mobile-MCPを使用したAndroidテスト用のpytest設定ファイル
+"""
+
+import asyncio
 import logging
 import os
-import platform
 import sys
-from importlib.metadata import version
-from typing import AsyncGenerator, Dict, Optional
+from typing import Optional
+import platform
 
 import allure
 import pytest
-from browser_use import Agent, BrowserProfile, BrowserSession
-from browser_use.llm import ChatOpenAI
-from browser_use.utils import get_browser_use_version
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 # Load environment variables from .env file
 load_dotenv()
 
 
-@pytest.fixture(scope="session")
-def browser_version_info(browser_profile: BrowserProfile) -> Dict[str, str]:
-    """
-    Fixture to get Playwright and browser version info.
-    """
-    try:
-        playwright_version = version("playwright")
-        with sync_playwright() as p:
-            browser_type_name = (
-                browser_profile.channel.value if browser_profile.channel else "chromium"
-            )
-            browser = p[browser_type_name].launch()
-            browser_version = browser.version
-            browser.close()
-        return {
-            "playwright_version": playwright_version,
-            "browser_version": browser_version,
-        }
-    except Exception as e:
-        logging.warning(f"Could not determine Playwright/browser version: {e}")
-        return {
-            "playwright_version": "N/A",
-            "browser_version": "N/A",
-        }
-
-
 @pytest.fixture(scope="session", autouse=True)
-def environment_reporter(
-    request: pytest.FixtureRequest,
-    llm: ChatOpenAI,
-    browser_profile: BrowserProfile,
-    browser_version_info: Dict[str, str],
-):
+def android_environment_reporter(request: pytest.FixtureRequest):
     """
-    Fixture to write environment details to a properties file for reporting.
-    This runs once per session and is automatically used.
-    By default, this creates `environment.properties` for Allure.
+    Android環境の詳細をレポート用に出力する
     """
     allure_dir = request.config.getoption("--alluredir")
     if not allure_dir or not isinstance(allure_dir, str):
@@ -63,24 +31,21 @@ def environment_reporter(
     ENVIRONMENT_PROPERTIES_FILENAME = "environment.properties"
     properties_file = os.path.join(allure_dir, ENVIRONMENT_PROPERTIES_FILENAME)
 
-    # Ensure the directory exists, with permission handling
+    # ディレクトリ作成
     try:
         os.makedirs(allure_dir, exist_ok=True)
     except PermissionError:
         logging.error(f"Permission denied to create report directory: {allure_dir}")
-        return  # Exit if we can't create the directory
+        return
 
     env_props = {
         "operating_system": f"{platform.system()} {platform.release()}",
         "python_version": sys.version.split(" ")[0],
-        "browser_use_version": get_browser_use_version(),
-        "playwright_version": browser_version_info["playwright_version"],
-        "browser_type": (
-            browser_profile.channel.value if browser_profile.channel else "chromium"
-        ),
-        "browser_version": browser_version_info["browser_version"],
-        "headless_mode": str(browser_profile.headless),
-        "llm_model": llm.model,
+        "test_framework": "pytest with mobile-mcp",
+        "mobile_automation": "mobile-mcp + Appium",
+        "target_platform": "Android",
+        "llm_model": "gpt-4o (OpenAI)",
+        "agent_framework": "LangGraph ReAct Agent",
     }
 
     try:
@@ -92,163 +57,166 @@ def environment_reporter(
 
 
 @pytest.fixture(scope="session")
-def llm() -> ChatOpenAI:
-    """Session-scoped fixture to initialize the language model."""
-    return ChatOpenAI(model="gpt-4o")
-
-
-@pytest.fixture(scope="session")
-def browser_profile() -> BrowserProfile:
-    """Session-scoped fixture for browser profile configuration."""
-    headless_mode = os.getenv("HEADLESS", "True").lower() in ("true", "1", "t")
-    return BrowserProfile(headless=headless_mode)
+def android_session_config():
+    """Androidテストセッション全体の設定"""
+    return {
+        "timeout": 300,  # 5分のデフォルトタイムアウト
+        "retry_count": 3,
+        "screenshot_on_failure": True,
+        "accessibility_tree_on_failure": True,
+    }
 
 
 @pytest.fixture(scope="function")
-async def browser_session(
-    browser_profile: BrowserProfile,
-) -> AsyncGenerator[BrowserSession, None]:
-    """Function-scoped fixture to manage the browser session's lifecycle."""
-    session = BrowserSession(browser_profile=browser_profile)
-    yield session
-    await session.close()
+async def android_agent_session(android_session_config):
+    """
+    各テスト関数用のAndroidエージェントセッション
+    
+    AndroidBaseAgentTestのインスタンスを作成し、テスト完了後にクリーンアップを行う
+    """
+    from android_base_agent_test import AndroidBaseAgentTest
+    
+    agent = AndroidBaseAgentTest()
+    
+    try:
+        # エージェントのセットアップ
+        await agent.setup_mobile_agent()
+        yield agent
+    finally:
+        # クリーンアップ
+        try:
+            await agent.cleanup()
+        except Exception as e:
+            logging.warning(f"Agent cleanup failed: {e}")
 
 
-# --- Base Test Class for Agent-based Tests ---
+@pytest.fixture(autouse=True)
+def android_test_logging(request):
+    """
+    各Androidテスト用のログ設定
+    """
+    test_name = request.node.name
+    logging.info(f"Starting Android test: {test_name}")
+    
+    yield
+    
+    logging.info(f"Completed Android test: {test_name}")
 
 
-class BaseAgentTest:
-    """Base class for agent-based tests to reduce boilerplate."""
-
-    BASE_URL = "https://discuss.google.dev/"
-
-    async def validate_task(
-        self,
-        llm: ChatOpenAI,
-        browser_session: BrowserSession,
-        task_instruction: str,
-        expected_substring: Optional[str] = None,
-        ignore_case: bool = False,
-    ) -> str:
-        """
-        Runs a task with the agent, prepends the BASE_URL, and performs common assertions.
-
-        Args:
-            llm: The language model instance.
-            browser_session: The browser session instance.
-            task_instruction: The specific instruction for the agent, without the "Go to URL" part.
-            expected_substring: An optional string to assert is present in the agent's result.
-            ignore_case: If True, the substring check will be case-insensitive.
-
-        Returns:
-            The final text result from the agent for any further custom assertions.
-        """
-        full_task = f"Go to {self.BASE_URL}, then {task_instruction}"
-
-        result_text = await run_agent_task(full_task, llm, browser_session)
-
-        assert result_text is not None, "Agent did not return a final result."
-
-        if expected_substring:
-            result_to_check = result_text.lower() if ignore_case else result_text
-            substring_to_check = (
-                expected_substring.lower() if ignore_case else expected_substring
-            )
-            assert (
-                substring_to_check in result_to_check
-            ), f"Assertion failed: Expected '{expected_substring}' not found in agent result: '{result_text}'"
-
-        return result_text
+# pytest-asyncio設定
+def pytest_configure(config):
+    """
+    pytest設定の初期化
+    """
+    # Androidテスト用のマーカー登録
+    config.addinivalue_line(
+        "markers", "android: mark test as Android mobile test"
+    )
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow running test"
+    )
+    config.addinivalue_line(
+        "markers", "browser: mark test as browser-based test"
+    )
 
 
-# --- Allure Hook for Step-by-Step Reporting ---
+# テスト失敗時のスクリーンショット撮影
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    """
+    テスト失敗時に自動的にスクリーンショットとコンテキスト情報を取得
+    """
+    outcome = yield
+    report = outcome.get_result()
+    
+    # テスト失敗時のみ実行
+    if report.when == "call" and report.failed:
+        # Androidエージェントのアクセスを試行
+        if hasattr(item.instance, 'android_agent'):
+            agent = item.instance.android_agent
+            if agent and agent.agent:
+                try:
+                    # 失敗時のコンテキスト情報を非同期で取得
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # 既にイベントループが実行中の場合は新しいタスクとして実行
+                        asyncio.create_task(_capture_failure_context(agent, item.name))
+                    else:
+                        # イベントループが実行されていない場合は新しく実行
+                        loop.run_until_complete(_capture_failure_context(agent, item.name))
+                except Exception as e:
+                    logging.error(f"Failed to capture failure context: {e}")
 
 
-async def record_step(agent: Agent):
-    """Hook function that captures and records agent activity at each step."""
-    history = agent.state.history
-    if not history:
-        return
-
-    last_action = history.model_actions()[-1] if history.model_actions() else {}
-    action_name = next(iter(last_action)) if last_action else "No action"
-    action_params = last_action.get(action_name, {})
-
-    step_title = f"Action: {action_name}"
-    if action_params:
-        param_str = ", ".join(f"{k}={v}" for k, v in action_params.items())
-        step_title += f"({param_str})"
-
-    with allure.step(step_title):
-        # Attach Agent Thoughts
-        thoughts = history.model_thoughts()
-        if thoughts:
-            allure.attach(
-                str(thoughts[-1]),
-                name="Agent Thoughts",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-
-        # Attach URL
-        url = history.urls()[-1] if history.urls() else "N/A"
+async def _capture_failure_context(agent, test_name: str):
+    """
+    テスト失敗時のコンテキスト情報をキャプチャ
+    """
+    try:
+        # スクリーンショット取得
+        await agent._attach_current_screenshot(f"Test Failure: {test_name}")
+        
+        # アクセシビリティツリー取得
+        await agent._attach_accessibility_tree(f"Test Failure: {test_name}")
+        
+        # 現在のアプリ状態情報取得
+        await agent._attach_app_state_info()
+        
+    except Exception as e:
+        # エラーメッセージをAllureに添付
         allure.attach(
-            url,
-            name="URL",
-            attachment_type=allure.attachment_type.URI_LIST,
+            f"Failed to capture context during test failure: {str(e)}",
+            name="Context Capture Error",
+            attachment_type=allure.attachment_type.TEXT
         )
 
-        # Attach Step Duration
-        last_history_item = history.history[-1] if history.history else None
-        if last_history_item and last_history_item.metadata:
-            duration = last_history_item.metadata.duration_seconds
-            allure.attach(
-                f"{duration:.2f}s",
-                name="Step Duration",
-                attachment_type=allure.attachment_type.TEXT,
-            )
 
-        # Attach Screenshot
-        if agent.browser_session:
-            try:
-                screenshot_b64 = await agent.browser_session.take_screenshot()
-                if screenshot_b64:
-                    screenshot_bytes = base64.b64decode(screenshot_b64)
-                    allure.attach(
-                        screenshot_bytes,
-                        name="Screenshot after Action",
-                        attachment_type=allure.attachment_type.PNG,
-                    )
-            except Exception as e:
-                logging.warning(f"Failed to take or attach screenshot: {e}")
+class AndroidBaseTest:
+    """
+    Android テスト用の基底クラス
+    
+    共通的なアサーションメソッドやヘルパー関数を提供
+    """
+    
+    @staticmethod
+    def assert_task_success(result: str, expected_substring: Optional[str] = None):
+        """
+        タスク実行結果の成功をアサート
+        
+        Args:
+            result: エージェントからの実行結果
+            expected_substring: 期待される部分文字列（オプション）
+        """
+        assert result is not None, "Agent did not return a result"
+        assert "error" not in result.lower(), f"Task failed with error: {result}"
+        
+        if expected_substring:
+            assert expected_substring.lower() in result.lower(), \
+                f"Expected '{expected_substring}' not found in result: {result}"
+    
+    @staticmethod 
+    def assert_screenshot_captured(result: str):
+        """
+        スクリーンショットが正常にキャプチャされたことをアサート
+        """
+        success_indicators = [
+            "screenshot", "captured", "image", "taken",
+            "visual", "display", "screen"
+        ]
+        
+        result_lower = result.lower()
+        assert any(indicator in result_lower for indicator in success_indicators), \
+            f"Screenshot capture not confirmed in result: {result}"
 
 
-# --- Helper Function to Run Agent ---
-
-
-@allure.step("Running browser agent with task: {task_description}")
-async def run_agent_task(
-    task_description: str,
-    llm: ChatOpenAI,
-    browser_session: BrowserSession,
-) -> Optional[str]:
-    """Initializes and runs the browser agent for a given task using an active browser session."""
-    logging.info(f"Running task: {task_description}")
-
-    agent = Agent(
-        task=task_description,
-        llm=llm,
-        browser_session=browser_session,
-        name=f"Agent for '{task_description[:50]}...'",
-    )
-
-    result = await agent.run(on_step_end=record_step)
-
-    final_text = result.final_result()
-    allure.attach(
-        final_text,
-        name="Agent Final Output",
-        attachment_type=allure.attachment_type.TEXT,
-    )
-
-    logging.info("Task finished.")
-    return final_text
+# Allure報告用のカスタムステップデコレータ
+def allure_android_step(step_description: str):
+    """
+    Android特有のステップ用Allureデコレータ
+    """
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            with allure.step(f"📱 {step_description}"):
+                return await func(*args, **kwargs)
+        return wrapper
+    return decorator

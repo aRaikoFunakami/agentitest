@@ -1,19 +1,32 @@
 """
-Android版BaseAgentTestクラス実装
-
-Mobile-MCPを使用してAndroidアプリケーションの自動化テストを実行する基底クラス
+Android Base Agent Test
+Pythonの単体テストからLLMエージェントを使ってAndroidアプリの自動操作テストを実行
 """
 
 import asyncio
 import time
 import os
 import base64
-from typing import Optional, Dict, Any
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
 import allure
+from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
+
+
+@dataclass
+class AgentState:
+    """エージェントの状態管理"""
+    device_id: Optional[str] = None
+    current_app: Optional[str] = None
+    operation_history: List[str] = None
+    
+    def __post_init__(self):
+        if self.operation_history is None:
+            self.operation_history = []
 
 
 class AndroidBaseAgentTest:
@@ -28,18 +41,30 @@ class AndroidBaseAgentTest:
     APPIUM_SERVER_URL = "http://localhost:4723"
     MCP_SERVER_TIMEOUT = 30.0
     
+    # クラス変数でデバイス情報をキャッシュ（重複検索防止）
+    _device_cache = {
+        'device_id': None,
+        'timestamp': None,
+        'cache_duration': 300  # 5分間キャッシュ
+    }
+    
     def __init__(self):
         """AndroidBaseAgentTestインスタンスの初期化"""
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.agent = None
         self.llm = ChatOpenAI(
-            model="gpt-4-turbo",
+            model="gpt-4.1",
             temperature=0,
             timeout=60,
-            max_retries=2
+            max_retries=2,
+            output_version="responses/v1",
         )
         self._current_device_id: Optional[str] = None
         self._current_app_bundle_id: Optional[str] = None
+        
+        # エージェント状態管理を追加
+        self.agent_state = AgentState()
+        self.conversation_history: List[Dict[str, str]] = []
     
     async def setup_mobile_agent(self, device_id: Optional[str] = None):
         """モバイルエージェントの初期化とセットアップ
@@ -48,10 +73,66 @@ class AndroidBaseAgentTest:
             device_id: 接続対象のAndroidデバイスID (省略時は自動検出)
         """
         await self._initialize_mcp_client()
-        await self._initialize_react_agent()
         
+        # デバイスIDをキャッシュから取得または検索
         if device_id:
-            await self._connect_to_device(device_id)
+            self._current_device_id = device_id
+            self._device_cache['device_id'] = device_id
+            self._device_cache['timestamp'] = time.time()
+        else:
+            self._current_device_id = await self._get_cached_device_id()
+        
+        await self._initialize_react_agent()
+    
+    async def _get_cached_device_id(self) -> str:
+        """キャッシュされたデバイスIDを取得、必要に応じて更新"""
+        current_time = time.time()
+        
+        # キャッシュが有効な場合はそれを使用
+        if (self._device_cache['device_id'] and 
+            self._device_cache['timestamp'] and
+            current_time - self._device_cache['timestamp'] < self._device_cache['cache_duration']):
+            return self._device_cache['device_id']
+        
+        # キャッシュが無効な場合のみデバイス検索を実行
+        try:
+            devices_result = await self.mcp_client.call_tool(
+                "mobile_list_available_devices",
+                arguments={}
+            )
+            
+            if devices_result and hasattr(devices_result, 'content'):
+                content = devices_result.content
+                if isinstance(content, list):
+                    device_text = "\n".join([item.get("text", str(item)) for item in content if isinstance(item, dict)])
+                else:
+                    device_text = content
+                
+                # emulator-5554 を優先的に検索
+                if "emulator-5554" in device_text:
+                    device_id = "emulator-5554"
+                elif "emulator-" in device_text:
+                    import re
+                    match = re.search(r'emulator-\d+', device_text)
+                    device_id = match.group() if match else None
+                else:
+                    device_id = None
+                
+                if device_id:
+                    # キャッシュを更新
+                    self._device_cache['device_id'] = device_id
+                    self._device_cache['timestamp'] = current_time
+                    return device_id
+                    
+        except Exception as e:
+            # エラー時はフォールバック値を使用
+            allure.attach(f"Device search error: {str(e)}", name="Device Search Warning", attachment_type=allure.attachment_type.TEXT)
+        
+        # フォールバック：デフォルトエミュレータID
+        fallback_device = "emulator-5554"
+        self._device_cache['device_id'] = fallback_device
+        self._device_cache['timestamp'] = current_time
+        return fallback_device
     
     async def _initialize_mcp_client(self):
         """MCP クライアントの初期化"""
@@ -74,37 +155,58 @@ class AndroidBaseAgentTest:
             raise RuntimeError("MCP client must be initialized first")
         
         mobile_tools = await self.mcp_client.get_tools()
+        
+        # LangGraphエージェントを作成（効率化設定）
         self.agent = create_react_agent(
             self.llm,
             mobile_tools,
             prompt=self._get_mobile_agent_prompt()
+            # 注意: create_react_agent()はrecursion_limitやmax_iterationsを引数として受け取らない
+            # これらの制限は実行時のconfigで指定する
         )
     
     def _get_mobile_agent_prompt(self) -> str:
-        """モバイルエージェント用のシステムプロンプト
+        """モバイルエージェント用の効率化されたシステムプロンプト
         
         Returns:
-            エージェントに与えるシステムプロンプト文字列
+            エージェントに与える最適化されたシステムプロンプト文字列
         """
-        return """You are a skilled mobile app testing assistant for Android devices.
+        device_override = self._current_device_id or "emulator-5554"
+        
+        return f"""ANDROID AUTOMATION AGENT - ULTRA HIGH PERFORMANCE MODE
 
-Your capabilities include:
-- Taking screenshots of the current screen
-- Getting accessibility tree information for element identification
-- Tapping elements by coordinates or accessibility identifiers
-- Typing text input in text fields
-- Performing swipe and scroll gestures
-- Launching and managing applications
-- Navigating between different apps and screens
+You are an Android automation specialist with MANDATORY efficiency requirements.
 
-Guidelines for successful testing:
-1. Always take a screenshot first to understand the current screen state
-2. Use accessibility tree information to accurately locate elements before tapping
-3. Wait for screen transitions to complete before proceeding
-4. Be precise with coordinates and element identification
-5. When completing a task successfully, always end your response with the exact phrase specified in the task instructions
+CRITICAL PERFORMANCE RULES (VIOLATION = FAILURE):
+1. DEVICE_ID_OVERRIDE: Use device "{device_override}" for ALL mobile operations
+2. NEVER call mobile_list_available_devices - device is pre-determined
+3. NEVER call mobile_list_apps unless EXPLICITLY required by task
+4. Execute actions using coordinates when possible (faster than element search)
+5. Take screenshots ONLY when verification is explicitly required
+6. Use mobile_launch_app with exact package names (no guessing)
+7. Execute operations in single calls - avoid verification loops
 
-This ending phrase is crucial for test validation and must be included exactly as specified."""
+MANDATORY EXECUTION PATTERN:
+1. Use device "{device_override}" directly in all mobile_* tool calls
+2. Launch apps immediately with mobile_launch_app
+3. Interact using mobile_click_on_screen_at_coordinates when possible
+4. Type text using mobile_type_keys with submit=true for efficiency
+5. Report completion immediately after action
+
+AVAILABLE TOOLS (Use efficiently):
+- mobile_launch_app: Direct app launching (use package name directly)
+- mobile_click_on_screen_at_coordinates: Preferred for clicking (fastest)
+- mobile_type_keys: Direct text input with submit option
+- mobile_take_screenshot: ONLY when explicitly required for verification
+- mobile_list_elements_on_screen: ONLY when specific element search needed
+
+RESPONSE REQUIREMENTS:
+- Execute actions immediately without hesitation
+- Keep responses brief and action-focused
+- End with exact success phrase when specified in task
+- Avoid explanatory text - focus on execution
+
+DEVICE CONTEXT: All operations target "{device_override}" - use this device ID in every mobile tool call."""
 
     async def _connect_to_device(self, device_id: str):
         """指定されたデバイスに接続
@@ -122,10 +224,10 @@ This ending phrase is crucial for test validation and must be included exactly a
         self,
         task_instruction: str,
         expected_substring: Optional[str] = None,
-        ignore_case: bool = False,
+        ignore_case: bool = True,
+        timeout: float = 30.0,
         device_id: Optional[str] = None,
-        app_bundle_id: Optional[str] = None,
-        timeout: float = 120.0
+        app_bundle_id: Optional[str] = None
     ) -> str:
         """モバイルタスクの実行と検証
         
@@ -175,6 +277,16 @@ This ending phrase is crucial for test validation and must be included exactly a
             assert isinstance(result_text, str), f"Agent returned non-string result: {type(result_text)}"
             assert len(result_text.strip()) > 0, "Agent returned empty result"
             
+            # 失敗条件の検証（先に実行）
+            failure_indicators = [
+                "failed", "error", "cannot", "unable", "not found", 
+                "timed out", "aborted", "unsuccessful", "could not"
+            ]
+            result_lower = result_text.lower()
+            for indicator in failure_indicators:
+                if indicator in result_lower and expected_substring and expected_substring.lower() not in result_lower:
+                    assert False, f"Task failed with indicator '{indicator}' in response: '{result_text}'"
+            
             # expected_substring検証（BaseAgentTestと同じロジック）
             if expected_substring:
                 result_to_check = result_text.lower() if ignore_case else result_text
@@ -184,6 +296,14 @@ This ending phrase is crucial for test validation and must be included exactly a
                 assert (
                     substring_to_check in result_to_check
                 ), f"Assertion failed: Expected '{expected_substring}' not found in agent result: '{result_text}'"
+            
+            # タスク成功の追加検証：十分な詳細性があるかチェック
+            if len(result_text.strip()) < 20:
+                allure.attach(
+                    f"Warning: Very short response may indicate incomplete execution: '{result_text}'",
+                    name="Response Length Warning",
+                    attachment_type=allure.attachment_type.TEXT
+                )
             
             # 実行時間記録
             execution_time = time.time() - start_time
@@ -205,15 +325,57 @@ This ending phrase is crucial for test validation and must be included exactly a
             raise
     
     async def _launch_application(self, app_bundle_id: str):
-        """指定されたアプリケーションを起動
+        """指定されたアプリケーションを起動（高速化版）
         
         Args:
             app_bundle_id: 起動するアプリケーションのBundle ID
         """
         with allure.step(f"Launch application: {app_bundle_id}"):
-            launch_task = f"Launch application with bundle ID: {app_bundle_id}"
-            await self._execute_agent_task(launch_task)
-            self._current_app_bundle_id = app_bundle_id
+            device_id = self._current_device_id or "emulator-5554"
+            
+            try:
+                # 直接mobile-mcpツールを呼び出し（エージェント推論をスキップ）
+                result = await self.mcp_client.call_tool(
+                    "mobile_launch_app",
+                    arguments={
+                        "device": device_id,
+                        "packageName": app_bundle_id
+                    }
+                )
+                
+                # 結果を処理
+                if result and hasattr(result, 'content'):
+                    content = result.content
+                    if isinstance(content, list):
+                        result_text = "\n".join([item.get("text", str(item)) for item in content if isinstance(item, dict)])
+                    else:
+                        result_text = content
+                    
+                    allure.attach(
+                        f"Direct app launch result: {result_text}",
+                        name="App Launch Result",
+                        attachment_type=allure.attachment_type.TEXT
+                    )
+                    
+                    self._current_app_bundle_id = app_bundle_id
+                    
+                    # 状態管理を更新
+                    self._update_agent_state(f"Launch application: {app_bundle_id}", result_text)
+                    
+                else:
+                    raise RuntimeError(f"Failed to launch app {app_bundle_id}")
+                    
+            except Exception as e:
+                # フォールバック：エージェント経由で起動
+                allure.attach(
+                    f"Direct launch failed: {str(e)}. Falling back to agent mode.",
+                    name="Launch Fallback",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+                
+                launch_task = f"Launch application with bundle ID: {app_bundle_id}"
+                await self._execute_agent_task(launch_task)
+                self._current_app_bundle_id = app_bundle_id
     
     async def _execute_agent_task(self, task: str) -> str:
         """エージェントタスクの実行と結果取得
@@ -231,22 +393,63 @@ This ending phrase is crucial for test validation and must be included exactly a
                 # タスク実行前のスクリーンショット取得
                 await self._capture_pre_task_state(task)
                 
-                # エージェント実行
-                response = await self.agent.ainvoke({
-                    "messages": [HumanMessage(content=task)]
-                })
+                # デバイス情報を含めたタスクメッセージを作成
+                enhanced_task = await self._enhance_task_with_device_info(task)
+                
+                # 会話履歴を含めたメッセージを構築
+                messages = self._build_conversation_with_history(enhanced_task)
+                
+                # エージェント実行（効率化設定）
+                response = await asyncio.wait_for(
+                    self.agent.ainvoke(
+                        {"messages": messages},
+                        config={"recursion_limit": 25}  # 15 → 25 に増加（スポーツナビゲーション対応）
+                    ),
+                    timeout=150  # 2.5分でタイムアウト（スポーツナビゲーション用）
+                )
                 
                 # 結果抽出
                 if not response or "messages" not in response or not response["messages"]:
                     raise RuntimeError("Invalid agent response structure")
                 
-                result = response["messages"][-1].content
+                # output_version="responses/v1" 対応: contentは文字列またはリスト
+                raw_result = response["messages"][-1].content
+                if isinstance(raw_result, list):
+                    # 新形式: リストから文字列を抽出
+                    result = "\n".join([item.get("text", str(item)) for item in raw_result if isinstance(item, dict)])
+                else:
+                    # 従来形式: 文字列
+                    result = raw_result
+                
                 duration = time.time() - start_time
+                
+                # 会話履歴を更新
+                self._update_conversation_history(enhanced_task, result)
+                
+                # エージェント状態を更新
+                self._update_agent_state(task, result)
+                
+                # パフォーマンス警告
+                if duration > 60:
+                    allure.attach(
+                        f"Task execution took {duration:.1f}s (target: <60s)\nTask: {task}",
+                        name="Performance Warning",
+                        attachment_type=allure.attachment_type.TEXT
+                    )
                 
                 # 実行後の状態とコンテキスト情報をAllureに添付
                 await self._attach_mobile_context(task, result, duration)
                 
                 return result
+                
+            except asyncio.TimeoutError:
+                timeout_msg = f"Task execution exceeded 120s timeout: {task}"
+                allure.attach(
+                    timeout_msg,
+                    name="Timeout Error",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+                raise TimeoutError(timeout_msg)
                 
             except Exception as e:
                 # エラー情報をAllureに添付
@@ -271,6 +474,25 @@ This ending phrase is crucial for test validation and must be included exactly a
                 
                 raise
     
+    async def _enhance_task_with_device_info(self, task: str) -> str:
+        """タスクにデバイス情報を追加して効率化
+        
+        Args:
+            task: 元のタスク指示文
+            
+        Returns:
+            デバイス情報が追加されたタスク指示文
+        """
+        device_id = self._current_device_id or "emulator-5554"
+        
+        device_info = f"""
+DEVICE OVERRIDE: Use device "{device_id}" for ALL mobile operations.
+DO NOT call mobile_list_available_devices - device is already determined.
+Execute all mobile_* tool calls with device parameter set to "{device_id}".
+
+"""
+        return device_info + task
+
     async def _capture_pre_task_state(self, task: str):
         """タスク実行前の画面状態をキャプチャ
         
@@ -329,36 +551,102 @@ This ending phrase is crucial for test validation and must be included exactly a
             context: スクリーンショットのコンテキスト情報
         """
         try:
-            if not self.agent:
+            if not self.mcp_client:
+                allure.attach(
+                    "MCP client not available for screenshot capture",
+                    name=f"Screenshot Error - {context}",
+                    attachment_type=allure.attachment_type.TEXT
+                )
                 return
+            
+            # mobile-mcpの直接呼び出しでスクリーンショットを取得
+            try:
+                # mobile_take_screenshotツールを直接呼び出し
+                screenshot_result = await self.mcp_client.call_tool(
+                    "mobile_take_screenshot",
+                    arguments={"device": self._current_device_id or "emulator-5554"}
+                )
                 
-            screenshot_response = await self.agent.ainvoke({
-                "messages": [HumanMessage(content="Take a screenshot of the current screen")]
-            })
-            
-            screenshot_content = screenshot_response["messages"][-1].content
-            
-            # Base64エンコードされた画像データの場合
-            if screenshot_content and isinstance(screenshot_content, str):
-                try:
-                    # Base64デコードを試行
-                    screenshot_bytes = base64.b64decode(screenshot_content)
+                # mobile-mcpのレスポンス構造に基づく処理
+                screenshot_data = None
+                
+                if screenshot_result and hasattr(screenshot_result, 'content'):
+                    content = screenshot_result.content
+                    
+                    # mobile-mcpは content: [{ type: "image", data: base64_string, mimeType: "image/png" }] を返す
+                    if isinstance(content, list) and len(content) > 0:
+                        image_content = content[0]
+                        if isinstance(image_content, dict) and image_content.get('type') == 'image':
+                            screenshot_data = image_content.get('data')
+                            mime_type = image_content.get('mimeType', 'image/png')
+                            
+                            if screenshot_data:
+                                try:
+                                    # Base64デコード
+                                    screenshot_bytes = base64.b64decode(screenshot_data)
+                                    
+                                    # MIMEタイプに基づいてAllure添付タイプを決定
+                                    if mime_type == 'image/jpeg':
+                                        attachment_type = allure.attachment_type.JPG
+                                    else:
+                                        attachment_type = allure.attachment_type.PNG
+                                    
+                                    allure.attach(
+                                        screenshot_bytes,
+                                        name=f"Screenshot - {context}",
+                                        attachment_type=attachment_type
+                                    )
+                                    return
+                                    
+                                except Exception as decode_error:
+                                    allure.attach(
+                                        f"Screenshot decode failed: {str(decode_error)}\n"
+                                        f"Data length: {len(screenshot_data)}\n"
+                                        f"MIME type: {mime_type}\n"
+                                        f"First 100 chars: {screenshot_data[:100]}",
+                                        name=f"Screenshot Decode Error - {context}",
+                                        attachment_type=allure.attachment_type.TEXT
+                                    )
+                            else:
+                                allure.attach(
+                                    f"No image data in content: {image_content}",
+                                    name=f"Screenshot No Data - {context}",
+                                    attachment_type=allure.attachment_type.TEXT
+                                )
+                        else:
+                            allure.attach(
+                                f"Unexpected content format: {content}",
+                                name=f"Screenshot Format Error - {context}",
+                                attachment_type=allure.attachment_type.TEXT
+                            )
+                    else:
+                        allure.attach(
+                            f"Content is not a list or empty: {content}",
+                            name=f"Screenshot Content Error - {context}",
+                            attachment_type=allure.attachment_type.TEXT
+                        )
+                else:
                     allure.attach(
-                        screenshot_bytes,
-                        name=f"Screenshot - {context}",
-                        attachment_type=allure.attachment_type.PNG
-                    )
-                except Exception:
-                    # Base64デコードに失敗した場合はテキストとして添付
-                    allure.attach(
-                        screenshot_content,
-                        name=f"Screenshot Data - {context}",
+                        f"No content in response: {screenshot_result}",
+                        name=f"Screenshot Response Error - {context}",
                         attachment_type=allure.attachment_type.TEXT
                     )
+                    
+            except Exception as tool_error:
+                # ツール呼び出し失敗の詳細ログ
+                allure.attach(
+                    f"Screenshot tool call failed: {str(tool_error)}\n"
+                    f"Error type: {type(tool_error)}\n"
+                    f"Device ID: {self._current_device_id}\n"
+                    f"Available tools: {list(await self.mcp_client.get_tools()) if self.mcp_client else 'N/A'}",
+                    name=f"Screenshot Tool Error - {context}",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+                        
         except Exception as e:
             allure.attach(
                 f"Failed to capture screenshot: {str(e)}",
-                name="Screenshot Error",
+                name=f"Screenshot Error - {context}",
                 attachment_type=allure.attachment_type.TEXT
             )
     
@@ -376,7 +664,12 @@ This ending phrase is crucial for test validation and must be included exactly a
                 "messages": [HumanMessage(content="Get the accessibility tree of the current screen")]
             })
             
-            tree_content = tree_response["messages"][-1].content
+            # output_version="responses/v1" 対応
+            raw_tree_content = tree_response["messages"][-1].content
+            if isinstance(raw_tree_content, list):
+                tree_content = "\n".join([item.get("text", str(item)) for item in raw_tree_content if isinstance(item, dict)])
+            else:
+                tree_content = raw_tree_content
             
             if tree_content and isinstance(tree_content, str):
                 allure.attach(
@@ -401,7 +694,12 @@ This ending phrase is crucial for test validation and must be included exactly a
                 "messages": [HumanMessage(content="Get current application information")]
             })
             
-            app_info = app_info_response["messages"][-1].content
+            # output_version="responses/v1" 対応
+            raw_app_info = app_info_response["messages"][-1].content
+            if isinstance(raw_app_info, list):
+                app_info = "\n".join([item.get("text", str(item)) for item in raw_app_info if isinstance(item, dict)])
+            else:
+                app_info = raw_app_info
             
             if app_info and isinstance(app_info, str):
                 allure.attach(
@@ -467,3 +765,90 @@ async def run_mobile_agent_task(
         return result
     finally:
         await android_agent.cleanup()
+
+
+# 状態管理メソッドの実装を AndroidBaseAgentTest クラスに追加
+def _add_state_management_methods():
+    """状態管理メソッドをAndroidBaseAgentTestクラスに追加"""
+    
+    def _build_conversation_with_history(self, current_task: str):
+        """会話履歴を含めたメッセージを構築"""
+        messages = []
+        device_id = self._current_device_id or "emulator-5554"
+        
+        # 過去の重要な操作履歴を含める（最近の5件まで）
+        if self.conversation_history:
+            history_summary = "PREVIOUS OPERATIONS:\n"
+            for entry in self.conversation_history[-5:]:  # 最近の5件
+                history_summary += f"- {entry['task']} -> {entry['result'][:100]}...\n"
+            
+            # デバイス状態情報を強制追加
+            history_summary += f"\nDEVICE OVERRIDE: Use device '{device_id}' for ALL operations.\n"
+            history_summary += "CRITICAL: Never call mobile_list_available_devices - device is predetermined.\n"
+            
+            if self.agent_state.current_app:
+                history_summary += f"CURRENT APP: {self.agent_state.current_app}\n"
+                
+            # システムメッセージとして履歴を追加
+            messages.append(HumanMessage(content=f"{history_summary}\nCURRENT TASK: {current_task}"))
+        else:
+            # 初回でもデバイス情報を明示
+            device_context = f"DEVICE OVERRIDE: Use device '{device_id}' for ALL mobile operations.\nNEVER call mobile_list_available_devices.\n\n"
+            messages.append(HumanMessage(content=device_context + current_task))
+            
+        return messages
+    
+    def _update_conversation_history(self, task: str, result: str):
+        """会話履歴を更新"""
+        self.conversation_history.append({
+            "task": task,
+            "result": result,
+            "timestamp": time.time()
+        })
+        
+        # 履歴が長くなりすぎないよう制限（最新10件まで）
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+    
+    def _update_agent_state(self, task: str, result: str):
+        """エージェント状態を更新"""
+        # 結果が文字列でない場合の処理（output_version="responses/v1"対応）
+        if not isinstance(result, str):
+            if isinstance(result, list):
+                result = "\n".join([item.get("text", str(item)) for item in result if isinstance(item, dict)])
+            else:
+                result = str(result)
+        
+        # デバイスIDを検出してキャッシュを更新
+        if "emulator-" in result or "device" in result.lower():
+            if "emulator-" in result:
+                import re
+                device_match = re.search(r'emulator-\d+', result)
+                if device_match:
+                    device_id = device_match.group()
+                    self.agent_state.device_id = device_id
+                    self._current_device_id = device_id
+                    # キャッシュも更新
+                    self._device_cache['device_id'] = device_id
+                    self._device_cache['timestamp'] = time.time()
+        
+        # アプリ起動を検出
+        if "launch" in task.lower() or "open" in task.lower():
+            if "chrome" in task.lower():
+                self.agent_state.current_app = "com.android.chrome"
+        
+        # 操作履歴に追加
+        operation_summary = f"{task} -> {result[:50]}..."
+        self.agent_state.operation_history.append(operation_summary)
+        
+        # 履歴制限（最新5件まで）
+        if len(self.agent_state.operation_history) > 5:
+            self.agent_state.operation_history = self.agent_state.operation_history[-5:]
+    
+    # メソッドをクラスに追加
+    AndroidBaseAgentTest._build_conversation_with_history = _build_conversation_with_history
+    AndroidBaseAgentTest._update_conversation_history = _update_conversation_history
+    AndroidBaseAgentTest._update_agent_state = _update_agent_state
+
+# 状態管理メソッドを追加
+_add_state_management_methods()
