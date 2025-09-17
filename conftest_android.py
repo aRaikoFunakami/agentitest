@@ -8,7 +8,6 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Optional
 import platform
 
 import allure
@@ -169,44 +168,6 @@ async def _capture_failure_context(agent, test_name: str):
             name="Context Capture Error",
             attachment_type=allure.attachment_type.TEXT
         )
-
-
-class AndroidBaseTest:
-    """
-    Android テスト用の基底クラス
-    
-    共通的なアサーションメソッドやヘルパー関数を提供
-    """
-    
-    @staticmethod
-    def assert_task_success(result: str, expected_substring: Optional[str] = None):
-        """
-        タスク実行結果の成功をアサート
-        
-        Args:
-            result: エージェントからの実行結果
-            expected_substring: 期待される部分文字列（オプション）
-        """
-        assert result is not None, "Agent did not return a result"
-        assert "error" not in result.lower(), f"Task failed with error: {result}"
-        
-        if expected_substring:
-            assert expected_substring.lower() in result.lower(), \
-                f"Expected '{expected_substring}' not found in result: {result}"
-    
-    @staticmethod 
-    def assert_screenshot_captured(result: str):
-        """
-        スクリーンショットが正常にキャプチャされたことをアサート
-        """
-        success_indicators = [
-            "screenshot", "captured", "image", "taken",
-            "visual", "display", "screen"
-        ]
-        
-        result_lower = result.lower()
-        assert any(indicator in result_lower for indicator in success_indicators), \
-            f"Screenshot capture not confirmed in result: {result}"
 
 
 # Allure報告用のカスタムステップデコレータ

@@ -73,9 +73,8 @@ FAILURE CONDITIONS (stop immediately if encountered):
 """
         
         result = await self.android_agent.validate_mobile_task(
-            task_instruction=task_instruction,
+            task=task_instruction,
             expected_substring="SPORTS_NEWS_LOADED_SUCCESSFULLY",
-            app_bundle_id="com.android.chrome",
             timeout=120.0
         )
         
@@ -125,8 +124,9 @@ Please perform the following basic Chrome operations:
 Please respond with "CHROME_BASIC_TEST_COMPLETE" when finished.
 """
         
-        result = await self.android_agent.execute_mobile_task(
-            task_instruction=chrome_task,
+        result = await self.android_agent.validate_mobile_task(
+            task=chrome_task,
+            expected_substring="CHROME_BASIC_TEST_COMPLETE",
             timeout=60.0
         )
         

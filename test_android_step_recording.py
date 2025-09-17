@@ -26,7 +26,7 @@ class TestAndroidStepRecording:
     @allure.description("""
     実装した新機能をテスト：
     1. エージェントの各アクション終了時にスクリーンショットが自動取得される
-    2. エージェントのThoughts（行動理由）が自動保存される
+    2. エージェントの行動が自動保存される
     3. ステップ実行時間が記録される
     4. 実際的なAndroidアプリ操作でのステップ記録動作を検証
     """)
@@ -37,9 +37,13 @@ class TestAndroidStepRecording:
         with allure.step("エージェントの思考プロセス取得テスト"):
             result = await self.android_agent.validate_mobile_task(
                 task="""
-                Chromeアプリを起動して、起動完了を示す"CHROME_LAUNCHED_SUCCESSFULLY"を返しなさい。最後にChromeアプリを閉じなさい。
+                Chromeアプリを起動して、
+                yahoo.co.jpにアクセスし、
+                スポーツニュースのカテゴリーに移動しなさい
+                スポーツニュースのコンテンツを選択して詳細ページに移動しなさい
+                そのときのURLを返しなさい
                 """,
-                expected_substring="CHROME_LAUNCHED_SUCCESSFULLY",
+                expected_substring="pickup",
                 ignore_case=True,
                 timeout=60.0,
             )

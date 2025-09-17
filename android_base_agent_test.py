@@ -13,7 +13,6 @@ from colorama import Fore, Style, init
 import allure
 from langgraph.prebuilt import create_react_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 init(autoreset=True)
@@ -176,7 +175,7 @@ class AndroidBaseAgentTest:
         """AndroidBaseAgentTestインスタンスの初期化"""
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.agent = None
-        self.llm = init_chat_model("openai:gpt-4o-mini", temperature=0)
+        self.llm = init_chat_model("openai:gpt-4.1", temperature=0)
         self._current_device_id: Optional[str] = None
         self._current_app_bundle_id: Optional[str] = None
         
@@ -297,7 +296,7 @@ class AndroidBaseAgentTest:
             execution_time = time.time() - start_time
 
             # テスト結果を記録
-            await self._attach_mobile_context(task, result_text, execution_time)
+            await self._attach_final_results(task, result_text, execution_time)
              
             return result_text
             
@@ -309,184 +308,6 @@ class AndroidBaseAgentTest:
             error_msg = f"Task execution failed: {str(e)}"
             allure.attach(error_msg, name="Execution Error", attachment_type=allure.attachment_type.TEXT)
             raise
-
-
-    
-
-    
-    async def _execute_agent_task(self, task: str) -> str:
-        """エージェントタスクの実行と結果取得
-        
-        Args:
-            task: 実行するタスクの指示文
-            
-        Returns:
-            エージェントの実行結果
-        """
-        with allure.step(f"Agent execution: {task}"):
-            start_time = time.time()
-            self._current_task_start_time = start_time  # タスク開始時間を記録
-            
-            try:
-                # タスク実行前のスクリーンショット取得
-                await self._capture_pre_task_state(task)
-                
-                # デバイス情報を含めたタスクメッセージを作成
-                enhanced_task = await self._enhance_task_with_device_info(task)
-                
-                # 会話履歴を含めたメッセージを構築
-                messages = self._build_conversation_with_history(enhanced_task)
-                
-                # エージェント実行（効率化設定）
-                response = await asyncio.wait_for(
-                    self.agent.ainvoke(
-                        {"messages": messages},
-                        config={"recursion_limit": 25}  # 15 → 25 に増加（スポーツナビゲーション対応）
-                    ),
-                    timeout=150  # 2.5分でタイムアウト（スポーツナビゲーション用）
-                )
-                
-                # 結果抽出
-                if not response or "messages" not in response or not response["messages"]:
-                    raise RuntimeError("Invalid agent response structure")
-                
-                # output_version="responses/v1" 対応: contentは文字列またはリスト
-                raw_result = response["messages"][-1].content
-                if isinstance(raw_result, list):
-                    # 新形式: リストから文字列を抽出
-                    result = "\n".join([item.get("text", str(item)) for item in raw_result if isinstance(item, dict)])
-                else:
-                    # 従来形式: 文字列
-                    result = raw_result
-                
-                # 【デバッグ】全てのメッセージを出力して中間ステップを確認
-                print(f"\n🔍 AGENT RESPONSE DEBUG - Total messages: {len(response['messages'])}")
-                
-                # 実際のエージェント思考プロセスを抽出
-                agent_thoughts = []
-                tool_calls_info = []
-                
-                for i, msg in enumerate(response["messages"]):
-                    print(f"Message {i}: {type(msg).__name__}")
-                    
-                    if hasattr(msg, 'content'):
-                        content = msg.content
-                        
-                        if isinstance(content, list):
-                            # 新形式: contentがリストの場合
-                            for item in content:
-                                if isinstance(item, dict):
-                                    if item.get('type') == 'reasoning':
-                                        reasoning_id = item.get('id', 'unknown')
-                                        print(f"  🧠 Found reasoning step: {reasoning_id}")
-                                        # reasoning の詳細内容があるかチェック
-                                        if 'content' in item:
-                                            agent_thoughts.append(item['content'])
-                                        elif 'summary' in item:
-                                            agent_thoughts.append(item['summary'])
-                                        else:
-                                            agent_thoughts.append(f"Reasoning step: {reasoning_id}")
-                                    elif item.get('type') == 'text':
-                                        text_content = item.get('text', '')
-                                        if text_content:
-                                            print(f"  📝 Text content: {text_content[:100]}...")
-                        else:
-                            # 従来形式: contentが文字列の場合
-                            content_preview = str(content)[:200] + "..." if len(str(content)) > 200 else str(content)
-                            print(f"  Content: {content_preview}")
-                    
-                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                        print(f"  Tool calls: {len(msg.tool_calls)}")
-                        for j, tool_call in enumerate(msg.tool_calls):
-                            tool_name = tool_call.get('name', 'unknown')
-                            tool_calls_info.append(tool_name)
-                            print(f"    Tool {j}: {tool_name}")
-                    print()
-                
-                # 抽出した思考プロセスをログ出力
-                if agent_thoughts:
-                    print(f"🧠 EXTRACTED AGENT THOUGHTS ({len(agent_thoughts)} items):")
-                    for idx, thought in enumerate(agent_thoughts):
-                        print(f"  Thought {idx+1}: {thought}")
-                else:
-                    print("⚠️ No agent thoughts found in reasoning steps")
-                
-                if tool_calls_info:
-                    print(f"🔧 TOOL CALLS MADE: {', '.join(tool_calls_info)}")
-                
-                duration = time.time() - start_time
-                
-                # 会話履歴を更新（実際の思考プロセスも含める）
-                self._update_conversation_history(enhanced_task, result, agent_thoughts, tool_calls_info)
-                
-                # エージェント状態を更新
-                self._update_agent_state(task, result)
-                
-                # --- 各アクション終了時の自動記録 ---
-                try:
-                    # conftest.pyのrecord_android_step関数を呼び出し
-                    from conftest import record_android_step
-                    await record_android_step(self)
-                except ImportError:
-                    # conftest.pyがインポートできない場合のフォールバック
-                    allure.attach(
-                        "record_android_step function not available",
-                        name="Step Recording Warning",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-                except Exception as step_recording_error:
-                    # ステップ記録エラーは警告レベルで処理（メインタスクの失敗にしない）
-                    allure.attach(
-                        f"Failed to record step: {str(step_recording_error)}",
-                        name="Step Recording Error",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-                
-                # パフォーマンス警告
-                if duration > 60:
-                    allure.attach(
-                        f"Task execution took {duration:.1f}s (target: <60s)\nTask: {task}",
-                        name="Performance Warning",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-                
-                # 実行後の状態とコンテキスト情報をAllureに添付
-                await self._attach_mobile_context(task, result, duration)
-                
-                return result
-                
-            except asyncio.TimeoutError:
-                timeout_msg = f"Task execution exceeded 120s timeout: {task}"
-                allure.attach(
-                    timeout_msg,
-                    name="Timeout Error",
-                    attachment_type=allure.attachment_type.TEXT
-                )
-                raise TimeoutError(timeout_msg)
-                
-            except Exception as e:
-                # エラー情報をAllureに添付
-                error_details = {
-                    "Task": task,
-                    "Error Type": type(e).__name__,
-                    "Error Message": str(e),
-                    "Execution Time": f"{time.time() - start_time:.2f}s"
-                }
-                
-                allure.attach(
-                    "\n".join([f"{k}: {v}" for k, v in error_details.items()]),
-                    name="Error Details",
-                    attachment_type=allure.attachment_type.TEXT
-                )
-                
-                # エラー時のスクリーンショット取得（可能であれば）
-                try:
-                    await self._capture_error_screenshot()
-                except Exception:
-                    pass  # エラー時のスクリーンショット失敗は無視
-                
-                raise
-
 
     async def _capture_pre_task_state(self, task: str):
         """タスク実行前の画面状態をキャプチャ
@@ -505,7 +326,7 @@ class AndroidBaseAgentTest:
                 attachment_type=allure.attachment_type.TEXT
             )
     
-    async def _attach_mobile_context(self, task: str, result: str, duration: float):
+    async def _attach_final_results(self, task: str, result: str, duration: float):
         """モバイルテスト実行コンテキストのAllure添付
         
         BaseAgentTestのrecord_step機能に相当する情報を記録
@@ -515,6 +336,7 @@ class AndroidBaseAgentTest:
             result: 実行結果
             duration: 実行時間
         """
+        print(Fore.BLUE + f"Attaching final results: {task[:50]}...")
         
         # エージェント実行結果を添付
         allure.attach(
@@ -788,4 +610,35 @@ class AndroidBaseAgentTest:
         self.agent = None
         self._current_device_id = None
         self._current_app_bundle_id = None
+
+    # AndroidBaseTestのユーティリティメソッドをマージ
+    @staticmethod
+    def assert_task_success(result: str, expected_substring: Optional[str] = None):
+        """
+        タスク実行結果の成功をアサート
+        
+        Args:
+            result: エージェントからの実行結果
+            expected_substring: 期待される部分文字列（オプション）
+        """
+        assert result is not None, "Agent did not return a result"
+        assert "error" not in result.lower(), f"Task failed with error: {result}"
+        
+        if expected_substring:
+            assert expected_substring.lower() in result.lower(), \
+                f"Expected '{expected_substring}' not found in result: {result}"
+    
+    @staticmethod 
+    def assert_screenshot_captured(result: str):
+        """
+        スクリーンショットが正常にキャプチャされたことをアサート
+        """
+        success_indicators = [
+            "screenshot", "captured", "image", "taken",
+            "visual", "display", "screen"
+        ]
+        
+        result_lower = result.lower()
+        assert any(indicator in result_lower for indicator in success_indicators), \
+            f"Screenshot capture not confirmed in result: {result}"
 
