@@ -126,6 +126,7 @@ def pytest_runtest_makereport(item, call):
     """
     テスト失敗時に自動的にスクリーンショットとコンテキスト情報を取得
     """
+    print("\n=== Start conftest.py pytest_runtest_makereport ===\n")
     outcome = yield
     report = outcome.get_result()
     
@@ -152,10 +153,11 @@ async def _capture_failure_context(agent, test_name: str):
     """
     テスト失敗時のコンテキスト情報をキャプチャ
     """
+    print("\n=== Start _capture_failure_context ===\n")
     try:
         # スクリーンショット取得（LLMを経由せずに直接ツール呼び出し）
-        await _capture_mobile_screenshot(agent, f"Test Failure: {test_name}")
-        
+        await agent._attach_current_screenshot(f"Test Failure: {test_name}")
+
         # アクセシビリティツリー取得
         await agent._attach_accessibility_tree(f"Test Failure: {test_name}")
         
@@ -169,138 +171,6 @@ async def _capture_failure_context(agent, test_name: str):
             name="Context Capture Error",
             attachment_type=allure.attachment_type.TEXT
         )
-
-
-async def _capture_mobile_screenshot(agent, context: str):
-    """
-    Mobile-MCPのmobile_save_screenshotツールから直接スクリーンショットを取得してAllureに添付
-    
-    mobile_take_screenshotからmobile_save_screenshotに変更:
-    - mobile_save_screenshotはファイルパスを返すため、ファイルを読み込んでAllureに添付
-    - より安定したスクリーンショット取得機能を提供
-    
-    Args:
-        agent: AndroidBaseAgentTestインスタンス
-        context: スクリーンショットのコンテキスト情報
-    """
-    try:
-        if not agent.mcp_client:
-            allure.attach(
-                "MCP client not available for screenshot capture",
-                name=f"Screenshot Error - {context}",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-            return
-        
-        # Mobile-MCPツールを取得して直接呼び出し（LLMを経由せず）
-        mobile_tools = await agent.mcp_client.get_tools()
-        screenshot_tool = None
-        
-        # mobile_save_screenshotツールを検索
-        for tool in mobile_tools:
-            if hasattr(tool, 'name') and tool.name == 'mobile_save_screenshot':
-                screenshot_tool = tool
-                break
-        
-        if not screenshot_tool:
-            allure.attach(
-                "mobile_save_screenshot tool not found in available tools",
-                name=f"Screenshot Tool Error - {context}",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-            return
-            
-        # device パラメータを使ってスクリーンショットを保存
-        device_id = agent._current_device_id or "emulator-5554"
-        
-        # 一時ファイルパスを生成
-        import tempfile
-        import time
-        temp_dir = tempfile.gettempdir()
-        screenshot_filename = f"conftest_screenshot_{int(time.time())}.png"
-        screenshot_path = os.path.join(temp_dir, screenshot_filename)
-        
-        # mobile_save_screenshotはファイルパスを返す（タイムアウト保護付き）
-        screenshot_result = await asyncio.wait_for(
-            screenshot_tool.ainvoke({
-                "device": device_id,
-                "saveTo": screenshot_path
-            }),
-            timeout=15.0  # 15秒のタイムアウト
-        )
-        
-        # デバッグ: screenshot_resultの内容をログ出力
-        print(f"DEBUG conftest: screenshot_result type: {type(screenshot_result)}")
-        print(f"DEBUG conftest: screenshot_result: {screenshot_result}")
-        print(f"DEBUG conftest: screenshot_path: {screenshot_path}")
-        
-        # mobile_save_screenshotの結果は保存が成功したことを示す
-        # 実際のファイルパスはscreenshot_pathに指定したパス
-        # mobile_save_screenshotの結果は保存が成功したことを示す
-        # 実際のファイルパスはscreenshot_pathに指定したパス
-        if os.path.exists(screenshot_path):
-            try:
-                # ファイルを読み込んでAllureに添付
-                with open(screenshot_path, 'rb') as f:
-                    screenshot_bytes = f.read()
-                
-                # ファイル拡張子から画像形式を判定
-                if screenshot_path.lower().endswith('.jpg') or screenshot_path.lower().endswith('.jpeg'):
-                    attachment_type = allure.attachment_type.JPG
-                elif screenshot_path.lower().endswith('.png'):
-                    attachment_type = allure.attachment_type.PNG
-                else:
-                    # ファイルヘッダーから判定
-                    if screenshot_bytes.startswith(b'\xff\xd8\xff'):
-                        attachment_type = allure.attachment_type.JPG
-                    elif screenshot_bytes.startswith(b'\x89PNG'):
-                        attachment_type = allure.attachment_type.PNG
-                    else:
-                        attachment_type = allure.attachment_type.PNG  # デフォルト
-                
-                allure.attach(
-                    screenshot_bytes,
-                    name=f"Screenshot - {context}",
-                    attachment_type=attachment_type
-                )
-                print(f"DEBUG conftest: スクリーンショットをAllureに添付完了: {screenshot_path}")
-                
-                # 一時ファイルを削除
-                try:
-                    os.remove(screenshot_path)
-                except Exception:
-                    pass  # 削除失敗は無視
-                
-                return
-                    
-            except Exception as e:
-                allure.attach(
-                    f"Failed to read screenshot file: {str(e)}",
-                    name=f"Screenshot File Read Error - {context}",
-                    attachment_type=allure.attachment_type.TEXT
-                )
-                return
-        else:
-            allure.attach(
-                f"Screenshot file not found at: {screenshot_path}",
-                name=f"Screenshot File Error - {context}",
-                attachment_type=allure.attachment_type.TEXT
-            )
-            return
-                        
-    except asyncio.TimeoutError:
-        allure.attach(
-            f"Screenshot capture timed out after 15 seconds",
-            name=f"Screenshot Timeout - {context}",
-            attachment_type=allure.attachment_type.TEXT
-        )
-    except Exception as e:
-        allure.attach(
-            f"Failed to capture mobile screenshot: {str(e)}",
-            name=f"Screenshot Error - {context}",
-            attachment_type=allure.attachment_type.TEXT
-        )
-
 
 class AndroidBaseTest:
     """
@@ -353,81 +223,72 @@ async def record_android_step(agent):
         agent: AndroidBaseAgentTestインスタンス
     """
     if not agent or not hasattr(agent, 'conversation_history'):
+        print("⚠️ Agent or conversation history not available for step recording")
         return
 
     # 最新の会話履歴から情報を取得
     if not agent.conversation_history:
+        print("⚠️ No conversation history available for step recording")
         return
     
     last_conversation = agent.conversation_history[-1]
     action_task = last_conversation.get('task', 'Unknown Action')
     action_result = last_conversation.get('result', 'No result')
     
-    # ステップタイトルを生成（Web版と同様の形式）
-    step_title = f"Mobile Action: {action_task[:50]}..."
+    print(f"\n📱 Starting Android step recording for: {action_task[:50]}...")
+    print(f"🔄 Result preview: {action_result[:100]}...")
     
-    with allure.step(step_title):
-        # Agent Thoughts を添付（結果から推論プロセスを抽出）
-        try:
-            thoughts_content = _extract_agent_thoughts(action_task, action_result)
-            if thoughts_content:
-                allure.attach(
-                    thoughts_content,
-                    name="Agent Thoughts",
-                    attachment_type=allure.attachment_type.TEXT,
-                )
-        except Exception as e:
+    # 【一時的に無効化】自動Allureステップ作成を停止してデバッグに集中
+    # with allure.step(step_title):
+    
+    # Agent Thoughts を添付（結果から推論プロセスを抽出）
+    try:
+        # 実際の思考プロセスとツール呼び出し情報を取得
+        agent_thoughts = last_conversation.get('agent_thoughts')
+        tool_calls = last_conversation.get('tool_calls')
+        
+        thoughts_content = _extract_agent_thoughts(action_task, action_result, agent_thoughts, tool_calls)
+        if thoughts_content:
+            print(f"📋 Agent thoughts extracted and attached to Allure report for: {action_task[:50]}...")
             allure.attach(
-                f"Failed to extract agent thoughts: {str(e)}",
-                name="Thoughts Extraction Error",
+                thoughts_content,
+                name="Agent Thoughts",
                 attachment_type=allure.attachment_type.TEXT,
             )
-
-        # デバイス情報を添付
-        device_id = agent._current_device_id or "emulator-5554"
+        else:
+            print(f"⚠️ No thoughts content generated for: {action_task[:50]}...")
+    except Exception as e:
+        print(f"❌ Failed to extract agent thoughts: {str(e)}")
         allure.attach(
-            f"Device: {device_id}",
-            name="Device Info",
+            f"Failed to extract agent thoughts: {str(e)}",
+            name="Thoughts Extraction Error",
             attachment_type=allure.attachment_type.TEXT,
         )
 
-        # 現在のアプリ情報を添付
-        if agent._current_app_bundle_id:
-            allure.attach(
-                agent._current_app_bundle_id,
-                name="Current App",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-
-        # ステップ実行時間を添付
-        timestamp = last_conversation.get('timestamp')
-        if timestamp:
-            import time
-            duration = time.time() - timestamp
-            allure.attach(
-                f"{duration:.2f}s",
-                name="Step Duration",
-                attachment_type=allure.attachment_type.TEXT,
-            )
-
-        # スクリーンショットを添付（アクション終了後の状態）
-        try:
-            await _capture_mobile_screenshot(agent, f"After Action: {action_task[:30]}...")
-        except Exception as e:
-            allure.attach(
-                f"Failed to capture screenshot: {str(e)}",
-                name="Screenshot Error",
-                attachment_type=allure.attachment_type.TEXT,
-            )
+    # スクリーンショットを添付（アクション終了後の状態）
+    try:
+        await agent._capture_mobile_screenshot(agent, f"After Action: {action_task[:30]}...")
+        print(f"📸 Screenshot captured for step: {action_task[:30]}...")
+    except Exception as e:
+        print(f"❌ Screenshot capture failed: {str(e)}")
+        allure.attach(
+            f"Failed to capture screenshot: {str(e)}",
+            name="Screenshot Error",
+            attachment_type=allure.attachment_type.TEXT,
+        )
+    
+    print(f"✅ Android step recording completed for: {action_task[:50]}...\n")
 
 
-def _extract_agent_thoughts(task: str, result: str) -> str:
+def _extract_agent_thoughts(task: str, result: str, agent_thoughts=None, tool_calls=None) -> str:
     """
     エージェントのタスクと結果から思考プロセスを抽出
     
     Args:
         task: 実行されたタスク
         result: エージェントの実行結果
+        agent_thoughts: 実際のエージェント思考プロセス（利用可能な場合）
+        tool_calls: 実行されたツール呼び出しのリスト
         
     Returns:
         抽出された思考プロセスの文字列
@@ -438,26 +299,39 @@ def _extract_agent_thoughts(task: str, result: str) -> str:
     thoughts_lines.append(f"🎯 Task Analysis: {task}")
     thoughts_lines.append("")
     
-    # タスクからの意図推論
-    task_lower = task.lower()
-    if "screenshot" in task_lower:
-        thoughts_lines.append("💭 Intent: Capture current screen state for verification")
-    elif "click" in task_lower or "tap" in task_lower:
-        thoughts_lines.append("💭 Intent: Interact with UI element through touch gesture")
-    elif "type" in task_lower or "input" in task_lower:
-        thoughts_lines.append("💭 Intent: Provide text input to form or search field")
-    elif "launch" in task_lower or "open" in task_lower:
-        thoughts_lines.append("💭 Intent: Start target application for test execution")
-    elif "navigate" in task_lower or "go to" in task_lower:
-        thoughts_lines.append("💭 Intent: Navigate to specific location or feature")
-    elif "scroll" in task_lower:
-        thoughts_lines.append("💭 Intent: Scroll to reveal additional content or elements")
-    elif "search" in task_lower:
-        thoughts_lines.append("💭 Intent: Find specific content or information")
+    # 実際の思考プロセスがある場合はそれを優先使用
+    if agent_thoughts and len(agent_thoughts) > 0:
+        thoughts_lines.append("🧠 Actual Agent Reasoning Process:")
+        for idx, thought in enumerate(agent_thoughts):
+            thoughts_lines.append(f"   Step {idx+1}: {thought}")
+        thoughts_lines.append("")
     else:
-        thoughts_lines.append("💭 Intent: Execute mobile automation operation")
+        # フォールバック：タスクからの意図推論
+        task_lower = task.lower()
+        if "screenshot" in task_lower:
+            thoughts_lines.append("💭 Intent: Capture current screen state for verification")
+        elif "click" in task_lower or "tap" in task_lower:
+            thoughts_lines.append("💭 Intent: Interact with UI element through touch gesture")
+        elif "type" in task_lower or "input" in task_lower:
+            thoughts_lines.append("💭 Intent: Provide text input to form or search field")
+        elif "launch" in task_lower or "open" in task_lower:
+            thoughts_lines.append("💭 Intent: Start target application for test execution")
+        elif "navigate" in task_lower or "go to" in task_lower:
+            thoughts_lines.append("💭 Intent: Navigate to specific location or feature")
+        elif "scroll" in task_lower:
+            thoughts_lines.append("💭 Intent: Scroll to reveal additional content or elements")
+        elif "search" in task_lower:
+            thoughts_lines.append("💭 Intent: Find specific content or information")
+        else:
+            thoughts_lines.append("💭 Intent: Execute mobile automation operation")
+        thoughts_lines.append("")
     
-    thoughts_lines.append("")
+    # 実際のツール呼び出し情報
+    if tool_calls and len(tool_calls) > 0:
+        thoughts_lines.append("🔧 Tools Actually Used:")
+        for tool in tool_calls:
+            thoughts_lines.append(f"   - {tool}")
+        thoughts_lines.append("")
     
     # 結果から実行されたアクションを推論
     result_lower = result.lower()
@@ -511,7 +385,17 @@ def _extract_agent_thoughts(task: str, result: str) -> str:
     thoughts_lines.append("📝 Execution Result Summary:")
     thoughts_lines.append(f"   {result_summary}")
     
-    return "\n".join(thoughts_lines)
+    # 生成された思考プロセスの完全な内容
+    thoughts_content = "\n".join(thoughts_lines)
+    
+    # stdout に思考プロセスを出力（見やすい形式で）
+    print("\n" + "="*60)
+    print("🧠 AGENT THOUGHTS EXTRACTED")
+    print("="*60)
+    print(thoughts_content)
+    print("="*60 + "\n")
+    
+    return thoughts_content
 
 
 # Allure報告用のカスタムステップデコレータ

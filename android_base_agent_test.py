@@ -6,16 +6,17 @@ Pythonの単体テストからLLMエージェントを使ってAndroidアプリ�
 import asyncio
 import time
 import os
-import base64
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+from colorama import Fore, Style, init
 
 import allure
 from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+init(autoreset=True)
 
 @dataclass
 class AgentState:
@@ -28,6 +29,134 @@ class AgentState:
         if self.operation_history is None:
             self.operation_history = []
 
+class EventPrinter:
+    """Pretty-printer for LangGraph astream_events.
+    This class prints only observable signals (no chain-of-thought):
+    - node start/end
+    - LLM streaming tokens (optional)
+    - final LLM outputs when provider buffers
+    - tool start/end with args and outputs
+    Configuration can be passed at construction for reuse.
+    """
+
+    def __init__(self,
+                 verbose: bool = False):
+        self.verbose = verbose
+        self.event_log = []  # イベントログを保持
+
+    def _log_and_attach(self, message: str, event_type: str = "Event"):
+        """print実行とallure.attachを両方行うラッパー関数
+        
+        Args:
+            message: ログメッセージ
+            event_type: イベントタイプ（Allure添付時の名前に使用）
+        """
+        # コンソールに出力
+        print(Fore.BLUE + message)
+        
+        # イベントログに追加
+        self.event_log.append(f"{time.time():.3f}: {message}")
+        
+        # Allureに添付（リアルタイム）
+        try:
+            allure.attach(
+                message,
+                name=f"Agent {event_type}",
+                attachment_type=allure.attachment_type.TEXT
+            )
+        except Exception:
+            # Allure添付失敗は無視（テスト実行は継続）
+            pass
+
+    def get_complete_log(self) -> str:
+        """完全なイベントログを取得"""
+        return "\n".join(self.event_log)
+
+    def attach_complete_log(self):
+        """完全なイベントログをAllureに添付"""
+        if self.event_log:
+            complete_log = self.get_complete_log()
+            try:
+                allure.attach(
+                    complete_log,
+                    name="Complete Agent Event Log",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+            except Exception:
+                pass
+
+    # --- public handlers ---
+    def on_node_start(self, ev):
+        node = ev.get("data", {}).get("node_name")
+        self._log_and_attach(
+            f"[NODE:START] {node}",
+            "Node Start"
+        )
+
+    def on_node_end(self, ev):
+        node = ev.get("data", {}).get("node_name")
+        self._log_and_attach(
+            f"[NODE:END] {node}",
+            "Node End"
+        )
+
+    def on_tool_start(self, ev):
+        d = ev.get("data", {})
+        name = ev.get("name") or "<tool>"
+        self._log_and_attach(
+            f"[TOOL:START] {name} args={d.get('input')}",
+            "Tool Start"
+        )
+
+    def on_tool_end(self, ev):
+        d = ev.get("data", {})
+        name = ev.get("name") or "<tool>"
+        output_content = d.get('output')
+        if hasattr(output_content, 'content'):
+            output_display = output_content.content
+        else:
+            output_display = str(output_content)
+        
+        self._log_and_attach(
+            f"[TOOL:END] {name} output={output_display}",
+            "Tool End"
+        )
+
+    def _print_on_chat_model_end(self, ev):
+        # ev['data']['output'] が AIMessage インスタンス
+        ai_msg = ev['data']['output'].content
+        self._log_and_attach(f"[MODEL:END] {ai_msg}","Model End")
+
+    def _print_on_chain_start(self, ev):
+        if self.verbose:
+            self._log_and_attach(f"[CHAIN:START] {ev.get('name')}","Chain Start")
+
+    def _print_on_chain_end(self, ev):
+        data = ev.get('data', {})
+        output = data.get('output')
+        if ev.get('name') == 'should_continue' and output:
+            message = "[CHAIN:END] should_continue, " + (output if not isinstance(output, list) else str(output[0]))
+            self._log_and_attach(message, "Chain End")
+        elif self.verbose:
+            self._log_and_attach(f"[CHAIN:END] {ev.get('name')},","Chain End")
+
+    def dispatch(self, ev):
+        et = ev.get("event", "")
+        
+        if et.endswith("node_start"):
+            self.on_node_start(ev)
+        elif et.endswith("node_end"):
+            self.on_node_end(ev)
+        elif et.endswith("tool_start"):
+            self.on_tool_start(ev)
+        elif et.endswith("tool_end"):
+            self.on_tool_end(ev)
+        elif et.endswith("on_chat_model_end"):
+            self._print_on_chat_model_end(ev)
+        elif et.endswith("on_chain_start"):
+            self._print_on_chain_start(ev)
+        elif et.endswith("on_chain_end"):
+            self._print_on_chain_end(ev)
 
 class AndroidBaseAgentTest:
     """Android アプリケーション自動化テスト用の基底クラス
@@ -35,12 +164,7 @@ class AndroidBaseAgentTest:
     Mobile-MCPを使用してAndroidデバイス上でアプリケーションテストを実行する。
     既存のBaseAgentTestクラスのAndroid版相当機能を提供。
     """
-    
-    # デフォルト設定
-    DEFAULT_APP_BUNDLE_ID = "com.android.chrome"
-    APPIUM_SERVER_URL = "http://localhost:4723"
-    MCP_SERVER_TIMEOUT = 30.0
-    
+
     # クラス変数でデバイス情報をキャッシュ（重複検索防止）
     _device_cache = {
         'device_id': None,
@@ -52,13 +176,7 @@ class AndroidBaseAgentTest:
         """AndroidBaseAgentTestインスタンスの初期化"""
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.agent = None
-        self.llm = ChatOpenAI(
-            model="gpt-4.1",
-            temperature=0,
-            timeout=60,
-            max_retries=2,
-            output_version="responses/v1",
-        )
+        self.llm = init_chat_model("openai:gpt-4o-mini", temperature=0)
         self._current_device_id: Optional[str] = None
         self._current_app_bundle_id: Optional[str] = None
         
@@ -72,98 +190,18 @@ class AndroidBaseAgentTest:
         Args:
             device_id: 接続対象のAndroidデバイスID (省略時は自動検出)
         """
-        await self._initialize_mcp_client()
-        
-        # デバイスIDをキャッシュから取得または検索
-        if device_id:
-            self._current_device_id = device_id
-            self._device_cache['device_id'] = device_id
-            self._device_cache['timestamp'] = time.time()
-        else:
-            self._current_device_id = await self._get_cached_device_id()
-        
         await self._initialize_react_agent()
     
-    async def _get_cached_device_id(self) -> str:
-        """キャッシュされたデバイスIDを取得、必要に応じて更新"""
-        current_time = time.time()
-        
-        # キャッシュが有効な場合はそれを使用
-        if (self._device_cache['device_id'] and 
-            self._device_cache['timestamp'] and
-            current_time - self._device_cache['timestamp'] < self._device_cache['cache_duration']):
-            return self._device_cache['device_id']
-        
-        # キャッシュが無効な場合のみデバイス検索を実行
-        try:
-            # MCPツールを取得して直接呼び出し
-            mobile_tools = await self.mcp_client.get_tools()
-            devices_tool = None
-            
-            # mobile_list_available_devicesツールを検索
-            for tool in mobile_tools:
-                if hasattr(tool, 'name') and tool.name == 'mobile_list_available_devices':
-                    devices_tool = tool
-                    break
-            
-            if not devices_tool:
-                print("mobile_list_available_devices tool not found")
-                return "emulator-5554"  # デフォルト値を返す
-                
-            devices_result = await devices_tool.ainvoke({})
-            
-            if devices_result and hasattr(devices_result, 'content'):
-                content = devices_result.content
-                if isinstance(content, list):
-                    device_text = "\n".join([item.get("text", str(item)) for item in content if isinstance(item, dict)])
-                else:
-                    device_text = content
-                
-                # emulator-5554 を優先的に検索
-                if "emulator-5554" in device_text:
-                    device_id = "emulator-5554"
-                elif "emulator-" in device_text:
-                    import re
-                    match = re.search(r'emulator-\d+', device_text)
-                    device_id = match.group() if match else None
-                else:
-                    device_id = None
-                
-                if device_id:
-                    # キャッシュを更新
-                    self._device_cache['device_id'] = device_id
-                    self._device_cache['timestamp'] = current_time
-                    return device_id
-                    
-        except Exception as e:
-            # エラー時はフォールバック値を使用
-            allure.attach(f"Device search error: {str(e)}", name="Device Search Warning", attachment_type=allure.attachment_type.TEXT)
-        
-        # フォールバック：デフォルトエミュレータID
-        fallback_device = "emulator-5554"
-        self._device_cache['device_id'] = fallback_device
-        self._device_cache['timestamp'] = current_time
-        return fallback_device
     
-    async def _initialize_mcp_client(self):
+    async def _initialize_react_agent(self):
         """MCP クライアントの初期化"""
         self.mcp_client = MultiServerMCPClient({
             "mobile": {
                 "transport": "stdio",
                 "command": "/opt/homebrew/opt/node@20/bin/npx",
                 "args": ["-y", "@mobilenext/mobile-mcp@latest"],
-                "env": {
-                    "APPIUM_SERVER": self.APPIUM_SERVER_URL,
-                    "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
-                    "PATH": os.environ.get("PATH", "")
-                }
             }
         })
-    
-    async def _initialize_react_agent(self):
-        """ReActエージェントの初期化"""
-        if not self.mcp_client:
-            raise RuntimeError("MCP client must be initialized first")
         
         mobile_tools = await self.mcp_client.get_tools()
         
@@ -177,112 +215,51 @@ class AndroidBaseAgentTest:
         )
     
     def _get_mobile_agent_prompt(self) -> str:
-        """モバイルエージェント用の効率化されたシステムプロンプト
-        
-        Returns:
-            エージェントに与える最適化されたシステムプロンプト文字列
+       return """あなたはAndroidデバイス上でアプリケーションを操作するエージェントです。
+        ユーザーの指示に従ってAndroidエミュレータもしくは実機を操作しなさい。
         """
-        device_override = self._current_device_id or "emulator-5554"
-        
-        return f"""ANDROID AUTOMATION AGENT - ULTRA HIGH PERFORMANCE MODE
-
-You are an Android automation specialist with MANDATORY efficiency requirements.
-
-CRITICAL PERFORMANCE RULES (VIOLATION = FAILURE):
-1. DEVICE_ID_OVERRIDE: Use device "{device_override}" for ALL mobile operations
-2. NEVER call mobile_list_available_devices - device is pre-determined
-3. NEVER call mobile_list_apps unless EXPLICITLY required by task
-4. Execute actions using coordinates when possible (faster than element search)
-5. Take screenshots ONLY when verification is explicitly required
-6. Use mobile_launch_app with exact package names (no guessing)
-7. Execute operations in single calls - avoid verification loops
-
-MANDATORY EXECUTION PATTERN:
-1. Use device "{device_override}" directly in all mobile_* tool calls
-2. Launch apps immediately with mobile_launch_app
-3. Interact using mobile_click_on_screen_at_coordinates when possible
-4. Type text using mobile_type_keys with submit=true for efficiency
-5. Report completion immediately after action
-
-AVAILABLE TOOLS (Use efficiently):
-- mobile_launch_app: Direct app launching (use package name directly)
-- mobile_click_on_screen_at_coordinates: Preferred for clicking (fastest)
-- mobile_type_keys: Direct text input with submit option
-- mobile_take_screenshot: ONLY when explicitly required for verification
-- mobile_list_elements_on_screen: ONLY when specific element search needed
-
-RESPONSE REQUIREMENTS:
-- Execute actions immediately without hesitation
-- Keep responses brief and action-focused
-- End with exact success phrase when specified in task
-- Avoid explanatory text - focus on execution
-
-DEVICE CONTEXT: All operations target "{device_override}" - use this device ID in every mobile tool call."""
-
-    async def _connect_to_device(self, device_id: str):
-        """指定されたデバイスに接続
-        
-        Args:
-            device_id: 接続対象のAndroidデバイスID
-        """
-        with allure.step(f"Connect to Android device: {device_id}"):
-            connect_task = f"Connect to Android device with ID: {device_id}"
-            await self._execute_agent_task(connect_task)
-            self._current_device_id = device_id
     
-    @allure.step("Execute mobile task: {task_instruction}")
+    @allure.step("Execute mobile task: {task}")
     async def validate_mobile_task(
         self,
-        task_instruction: str,
+        task: str,
         expected_substring: Optional[str] = None,
         ignore_case: bool = True,
         timeout: float = 30.0,
-        device_id: Optional[str] = None,
-        app_bundle_id: Optional[str] = None
     ) -> str:
-        """モバイルタスクの実行と検証
-        
-        Browser UseのBaseAgentTest.validate_taskメソッドのAndroid版相当機能。
-        指定されたタスクをMobile-MCPエージェントで実行し、結果を検証する。
-        
-        Args:
-            task_instruction: エージェントに実行させる具体的な指示
-            expected_substring: 結果に含まれることを期待する文字列
-            ignore_case: 文字列比較時の大文字小文字無視フラグ
-            device_id: 対象デバイスID (未指定時は現在接続中のデバイス使用)
-            app_bundle_id: 対象アプリのBundle ID (指定時は事前起動)
-            timeout: タスク実行のタイムアウト時間（秒）
-            
-        Returns:
-            エージェントが返した最終結果テキスト
-            
-        Raises:
-            AssertionError: 結果がNoneまたは期待する文字列が見つからない場合
-            TimeoutError: 実行がタイムアウトした場合
-        """
         
         start_time = time.time()
+
+        print(Fore.YELLOW + f"\n=== Executing mobile task ===\nInstruction: {task}\nExpected substring: {expected_substring}\nTimeout: {timeout}s\n")
         
         try:
-            # エージェント初期化チェック
-            if not self.agent:
-                await self.setup_mobile_agent(device_id)
-            
-            # デバイス接続（必要に応じて）
-            if device_id and device_id != self._current_device_id:
-                await self._connect_to_device(device_id)
-            
-            # アプリ起動（指定された場合）
-            if app_bundle_id and app_bundle_id != self._current_app_bundle_id:
-                await self._launch_application(app_bundle_id)
-            
             # メインタスク実行
-            allure.dynamic.description(f"Executing: {task_instruction}")
-            result_text = await asyncio.wait_for(
-                self._execute_agent_task(task_instruction),
-                timeout=timeout
-            )
+            allure.dynamic.description(f"Executing: {task}")
+
+            # タスク実行前のスクリーンショット取得
+            await self._capture_pre_task_state(task)
+
+            post_task_message = "\nタスクを実行するために必要な操作を計画しなさい。次に計画を１つ１つ実行しなさい。"
+            inputs = {"messages": [
+                ("user", f"{task}"),
+                ("user", post_task_message)
+            ]}
+            result_text = None
+            printer = EventPrinter()
+            async for ev in self.agent.astream_events(inputs, version="v2"):
+                printer.dispatch(ev)
+                if ev.get("event", "").endswith("on_chat_model_end"):
+                    final_message = ev.get("data", {}).get("output")
+                    print(f"DEBUG: final_message: {final_message}")
             
+            # EventPrinterの完全ログをAllureに添付
+            printer.attach_complete_log()
+            
+            result_text = final_message.content
+            #result_text = final_message
+
+            print(Fore.YELLOW + f"\n=== Finish self.agent.astream_events ===\n {final_message.content}\n{'='*50}\n")
+
             # 基本結果検証
             assert result_text is not None, "Agent returned None result"
             assert isinstance(result_text, str), f"Agent returned non-string result: {type(result_text)}"
@@ -297,7 +274,7 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
             for indicator in failure_indicators:
                 if indicator in result_lower and expected_substring and expected_substring.lower() not in result_lower:
                     assert False, f"Task failed with indicator '{indicator}' in response: '{result_text}'"
-            
+
             # expected_substring検証（BaseAgentTestと同じロジック）
             if expected_substring:
                 result_to_check = result_text.lower() if ignore_case else result_text
@@ -318,12 +295,10 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
             
             # 実行時間記録
             execution_time = time.time() - start_time
-            allure.attach(
-                f"Task completed in {execution_time:.2f} seconds",
-                name="Execution Time",
-                attachment_type=allure.attachment_type.TEXT
-            )
-            
+
+            # テスト結果を記録
+            await self._attach_mobile_context(task, result_text, execution_time)
+             
             return result_text
             
         except asyncio.TimeoutError:
@@ -334,68 +309,10 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
             error_msg = f"Task execution failed: {str(e)}"
             allure.attach(error_msg, name="Execution Error", attachment_type=allure.attachment_type.TEXT)
             raise
+
+
     
-    async def _launch_application(self, app_bundle_id: str):
-        """指定されたアプリケーションを起動（高速化版）
-        
-        Args:
-            app_bundle_id: 起動するアプリケーションのBundle ID
-        """
-        with allure.step(f"Launch application: {app_bundle_id}"):
-            device_id = self._current_device_id or "emulator-5554"
-            
-            try:
-                # MCPツールを取得して直接呼び出し
-                mobile_tools = await self.mcp_client.get_tools()
-                launch_tool = None
-                
-                # mobile_launch_appツールを検索
-                for tool in mobile_tools:
-                    if hasattr(tool, 'name') and tool.name == 'mobile_launch_app':
-                        launch_tool = tool
-                        break
-                
-                if not launch_tool:
-                    raise RuntimeError("mobile_launch_app tool not found")
-                    
-                result = await launch_tool.ainvoke({
-                    "device": device_id,
-                    "packageName": app_bundle_id
-                })
-                
-                # 結果を処理
-                if result and hasattr(result, 'content'):
-                    content = result.content
-                    if isinstance(content, list):
-                        result_text = "\n".join([item.get("text", str(item)) for item in content if isinstance(item, dict)])
-                    else:
-                        result_text = content
-                    
-                    allure.attach(
-                        f"Direct app launch result: {result_text}",
-                        name="App Launch Result",
-                        attachment_type=allure.attachment_type.TEXT
-                    )
-                    
-                    self._current_app_bundle_id = app_bundle_id
-                    
-                    # 状態管理を更新
-                    self._update_agent_state(f"Launch application: {app_bundle_id}", result_text)
-                    
-                else:
-                    raise RuntimeError(f"Failed to launch app {app_bundle_id}")
-                    
-            except Exception as e:
-                # フォールバック：エージェント経由で起動
-                allure.attach(
-                    f"Direct launch failed: {str(e)}. Falling back to agent mode.",
-                    name="Launch Fallback",
-                    attachment_type=allure.attachment_type.TEXT
-                )
-                
-                launch_task = f"Launch application with bundle ID: {app_bundle_id}"
-                await self._execute_agent_task(launch_task)
-                self._current_app_bundle_id = app_bundle_id
+
     
     async def _execute_agent_task(self, task: str) -> str:
         """エージェントタスクの実行と結果取得
@@ -442,10 +359,65 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
                     # 従来形式: 文字列
                     result = raw_result
                 
+                # 【デバッグ】全てのメッセージを出力して中間ステップを確認
+                print(f"\n🔍 AGENT RESPONSE DEBUG - Total messages: {len(response['messages'])}")
+                
+                # 実際のエージェント思考プロセスを抽出
+                agent_thoughts = []
+                tool_calls_info = []
+                
+                for i, msg in enumerate(response["messages"]):
+                    print(f"Message {i}: {type(msg).__name__}")
+                    
+                    if hasattr(msg, 'content'):
+                        content = msg.content
+                        
+                        if isinstance(content, list):
+                            # 新形式: contentがリストの場合
+                            for item in content:
+                                if isinstance(item, dict):
+                                    if item.get('type') == 'reasoning':
+                                        reasoning_id = item.get('id', 'unknown')
+                                        print(f"  🧠 Found reasoning step: {reasoning_id}")
+                                        # reasoning の詳細内容があるかチェック
+                                        if 'content' in item:
+                                            agent_thoughts.append(item['content'])
+                                        elif 'summary' in item:
+                                            agent_thoughts.append(item['summary'])
+                                        else:
+                                            agent_thoughts.append(f"Reasoning step: {reasoning_id}")
+                                    elif item.get('type') == 'text':
+                                        text_content = item.get('text', '')
+                                        if text_content:
+                                            print(f"  📝 Text content: {text_content[:100]}...")
+                        else:
+                            # 従来形式: contentが文字列の場合
+                            content_preview = str(content)[:200] + "..." if len(str(content)) > 200 else str(content)
+                            print(f"  Content: {content_preview}")
+                    
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        print(f"  Tool calls: {len(msg.tool_calls)}")
+                        for j, tool_call in enumerate(msg.tool_calls):
+                            tool_name = tool_call.get('name', 'unknown')
+                            tool_calls_info.append(tool_name)
+                            print(f"    Tool {j}: {tool_name}")
+                    print()
+                
+                # 抽出した思考プロセスをログ出力
+                if agent_thoughts:
+                    print(f"🧠 EXTRACTED AGENT THOUGHTS ({len(agent_thoughts)} items):")
+                    for idx, thought in enumerate(agent_thoughts):
+                        print(f"  Thought {idx+1}: {thought}")
+                else:
+                    print("⚠️ No agent thoughts found in reasoning steps")
+                
+                if tool_calls_info:
+                    print(f"🔧 TOOL CALLS MADE: {', '.join(tool_calls_info)}")
+                
                 duration = time.time() - start_time
                 
-                # 会話履歴を更新
-                self._update_conversation_history(enhanced_task, result)
+                # 会話履歴を更新（実際の思考プロセスも含める）
+                self._update_conversation_history(enhanced_task, result, agent_thoughts, tool_calls_info)
                 
                 # エージェント状態を更新
                 self._update_agent_state(task, result)
@@ -514,25 +486,7 @@ DEVICE CONTEXT: All operations target "{device_override}" - use this device ID i
                     pass  # エラー時のスクリーンショット失敗は無視
                 
                 raise
-    
-    async def _enhance_task_with_device_info(self, task: str) -> str:
-        """タスクにデバイス情報を追加して効率化
-        
-        Args:
-            task: 元のタスク指示文
-            
-        Returns:
-            デバイス情報が追加されたタスク指示文
-        """
-        device_id = self._current_device_id or "emulator-5554"
-        
-        device_info = f"""
-DEVICE OVERRIDE: Use device "{device_id}" for ALL mobile operations.
-DO NOT call mobile_list_available_devices - device is already determined.
-Execute all mobile_* tool calls with device parameter set to "{device_id}".
 
-"""
-        return device_info + task
 
     async def _capture_pre_task_state(self, task: str):
         """タスク実行前の画面状態をキャプチャ
@@ -582,8 +536,6 @@ Execute all mobile_* tool calls with device parameter set to "{device_id}".
         # アクセシビリティツリー情報取得・添付
         await self._attach_accessibility_tree(task)
         
-        # 現在のアプリ状態情報取得・添付
-        await self._attach_app_state_info()
     
     async def _attach_current_screenshot(self, context: str):
         """現在の画面のスクリーンショットを取得してAllureに添付
@@ -722,74 +674,97 @@ Execute all mobile_* tool calls with device parameter set to "{device_id}".
             task: 関連するタスク情報
         """
         try:
-            if not self.agent:
+            print(f"DEBUG: _attach_accessibility_tree starting for task: {task[:30]}...")
+            
+            if not self.mcp_client:
+                print("DEBUG: MCP client not available")
+                allure.attach(
+                    "MCP client not available for accessibility tree capture",
+                    name=f"Accessibility Tree Error - {task[:30]}...",
+                    attachment_type=allure.attachment_type.TEXT
+                )
                 return
-                
-            tree_response = await self.agent.ainvoke({
-                "messages": [HumanMessage(content="Get the accessibility tree of the current screen")]
-            })
             
-            # output_version="responses/v1" 対応
-            raw_tree_content = tree_response["messages"][-1].content
-            if isinstance(raw_tree_content, list):
-                tree_content = "\n".join([item.get("text", str(item)) for item in raw_tree_content if isinstance(item, dict)])
+            # Mobile-MCPツールを取得
+            print("DEBUG: Getting mobile tools...")
+            mobile_tools = await self.mcp_client.get_tools()
+            accessibility_tool = None
+            
+            # mobile_list_elements_on_screenツールを検索
+            print("DEBUG: Searching for mobile_list_elements_on_screen tool...")
+            for tool in mobile_tools:
+                if hasattr(tool, 'name') and tool.name == 'mobile_list_elements_on_screen':
+                    accessibility_tool = tool
+                    print("DEBUG: Found mobile_list_elements_on_screen tool")
+                    break
+            
+            if not accessibility_tool:
+                print("DEBUG: mobile_list_elements_on_screen tool not found")
+                allure.attach(
+                    "mobile_list_elements_on_screen tool not found in available tools",
+                    name=f"Accessibility Tool Error - {task[:30]}...",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+                return
+            
+            # デバイスIDを使って画面要素を取得（タイムアウト保護付き）
+            device_id = self._current_device_id or "emulator-5554"
+            print(f"DEBUG: Invoking accessibility tool with device: {device_id}")
+            
+            tree_result = await asyncio.wait_for(
+                accessibility_tool.ainvoke({
+                    "device": device_id
+                }),
+                timeout=15.0  # 15秒のタイムアウト
+            )
+            
+            print(f"DEBUG: Got tree_result type: {type(tree_result)}")
+            print(f"DEBUG: tree_result content preview: {str(tree_result)[:100]}...")
+            
+            # ツールの結果を文字列として処理
+            if isinstance(tree_result, str):
+                tree_content = tree_result
+                print("DEBUG: Using tree_result as string")
+            elif hasattr(tree_result, 'content'):
+                tree_content = tree_result.content
+                print("DEBUG: Using tree_result.content")
             else:
-                tree_content = raw_tree_content
+                tree_content = str(tree_result)
+                print("DEBUG: Converting tree_result to string")
             
-            if tree_content and isinstance(tree_content, str):
+            print(f"DEBUG: Final tree_content length: {len(tree_content) if tree_content else 0}")
+            
+            if tree_content and len(tree_content.strip()) > 0:
+                print("DEBUG: Attaching accessibility tree to Allure")
                 allure.attach(
                     tree_content,
                     name=f"Accessibility Tree - {task[:30]}...",
-                    attachment_type=allure.attachment_type.XML
+                    attachment_type=allure.attachment_type.TEXT  # JSONではなくTEXTに変更
                 )
+                print("DEBUG: Successfully attached accessibility tree")
+            else:
+                print("DEBUG: No tree content, attaching empty message")
+                allure.attach(
+                    "No accessibility tree data returned",
+                    name=f"Accessibility Tree Empty - {task[:30]}...",
+                    attachment_type=allure.attachment_type.TEXT
+                )
+                
+        except asyncio.TimeoutError:
+            print("DEBUG: Accessibility tree capture timed out")
+            allure.attach(
+                "Accessibility tree capture timed out after 15 seconds",
+                name=f"Accessibility Tree Timeout - {task[:30]}...",
+                attachment_type=allure.attachment_type.TEXT
+            )
         except Exception as e:
+            print(f"DEBUG: Exception in _attach_accessibility_tree: {str(e)}")
             allure.attach(
                 f"Failed to capture accessibility tree: {str(e)}",
                 name="Accessibility Tree Error",
                 attachment_type=allure.attachment_type.TEXT
             )
-    
-    async def _attach_app_state_info(self):
-        """現在のアプリケーション状態情報を取得してAllureに添付"""
-        try:
-            if not self.agent:
-                return
-            
-            # タイムアウトを設定してAPIリクエストを保護
-            app_info_response = await asyncio.wait_for(
-                self.agent.ainvoke({
-                    "messages": [HumanMessage(content="Get current application information")]
-                }),
-                timeout=10.0  # 10秒のタイムアウト
-            )
-            
-            # output_version="responses/v1" 対応
-            raw_app_info = app_info_response["messages"][-1].content
-            if isinstance(raw_app_info, list):
-                app_info = "\n".join([item.get("text", str(item)) for item in raw_app_info if isinstance(item, dict)])
-            else:
-                app_info = raw_app_info
-            
-            if app_info and isinstance(app_info, str):
-                allure.attach(
-                    app_info,
-                    name="Current App State",
-                    attachment_type=allure.attachment_type.TEXT
-                )
-        except asyncio.TimeoutError:
-            # アプリ状態取得がタイムアウトした場合
-            allure.attach(
-                "App state info request timed out after 10 seconds",
-                name="App State Timeout",
-                attachment_type=allure.attachment_type.TEXT
-            )
-        except Exception as e:
-            # その他のエラーの場合、詳細を記録
-            allure.attach(
-                f"Failed to get app state info: {str(e)}",
-                name="App State Error", 
-                attachment_type=allure.attachment_type.TEXT
-            )
+
     
     async def _capture_error_screenshot(self):
         """エラー発生時の緊急スクリーンショット取得"""
@@ -814,122 +789,3 @@ Execute all mobile_* tool calls with device parameter set to "{device_id}".
         self._current_device_id = None
         self._current_app_bundle_id = None
 
-
-# BaseAgentTestとの互換性のためのヘルパー関数
-async def run_mobile_agent_task(
-    llm: ChatOpenAI,
-    task_instruction: str,
-    device_id: Optional[str] = None,
-    timeout: float = 120.0
-) -> str:
-    """Mobile-MCP版のrun_agent_task相当機能
-    
-    既存のBaseAgentTestのrun_agent_task関数のAndroid版。
-    一時的なエージェントインスタンスでタスクを実行する。
-    
-    Args:
-        llm: 使用する言語モデル
-        task_instruction: 実行するタスク指示
-        device_id: 対象デバイスID
-        timeout: タイムアウト時間
-        
-    Returns:
-        エージェントの実行結果
-    """
-    android_agent = AndroidBaseAgentTest()
-    android_agent.llm = llm
-    
-    try:
-        await android_agent.setup_mobile_agent(device_id)
-        result = await android_agent._execute_agent_task(task_instruction)
-        return result
-    finally:
-        await android_agent.cleanup()
-
-
-# 状態管理メソッドの実装を AndroidBaseAgentTest クラスに追加
-def _add_state_management_methods():
-    """状態管理メソッドをAndroidBaseAgentTestクラスに追加"""
-    
-    def _build_conversation_with_history(self, current_task: str):
-        """会話履歴を含めたメッセージを構築"""
-        messages = []
-        device_id = self._current_device_id or "emulator-5554"
-        
-        # 過去の重要な操作履歴を含める（最近の5件まで）
-        if self.conversation_history:
-            history_summary = "PREVIOUS OPERATIONS:\n"
-            for entry in self.conversation_history[-5:]:  # 最近の5件
-                history_summary += f"- {entry['task']} -> {entry['result'][:100]}...\n"
-            
-            # デバイス状態情報を強制追加
-            history_summary += f"\nDEVICE OVERRIDE: Use device '{device_id}' for ALL operations.\n"
-            history_summary += "CRITICAL: Never call mobile_list_available_devices - device is predetermined.\n"
-            
-            if self.agent_state.current_app:
-                history_summary += f"CURRENT APP: {self.agent_state.current_app}\n"
-                
-            # システムメッセージとして履歴を追加
-            messages.append(HumanMessage(content=f"{history_summary}\nCURRENT TASK: {current_task}"))
-        else:
-            # 初回でもデバイス情報を明示
-            device_context = f"DEVICE OVERRIDE: Use device '{device_id}' for ALL mobile operations.\nNEVER call mobile_list_available_devices.\n\n"
-            messages.append(HumanMessage(content=device_context + current_task))
-            
-        return messages
-    
-    def _update_conversation_history(self, task: str, result: str):
-        """会話履歴を更新"""
-        self.conversation_history.append({
-            "task": task,
-            "result": result,
-            "timestamp": time.time(),
-            "start_time": getattr(self, '_current_task_start_time', time.time())  # タスク開始時間
-        })
-        
-        # 履歴が長くなりすぎないよう制限（最新10件まで）
-        if len(self.conversation_history) > 10:
-            self.conversation_history = self.conversation_history[-10:]
-    
-    def _update_agent_state(self, task: str, result: str):
-        """エージェント状態を更新"""
-        # 結果が文字列でない場合の処理（output_version="responses/v1"対応）
-        if not isinstance(result, str):
-            if isinstance(result, list):
-                result = "\n".join([item.get("text", str(item)) for item in result if isinstance(item, dict)])
-            else:
-                result = str(result)
-        
-        # デバイスIDを検出してキャッシュを更新
-        if "emulator-" in result or "device" in result.lower():
-            if "emulator-" in result:
-                import re
-                device_match = re.search(r'emulator-\d+', result)
-                if device_match:
-                    device_id = device_match.group()
-                    self.agent_state.device_id = device_id
-                    self._current_device_id = device_id
-                    # キャッシュも更新
-                    self._device_cache['device_id'] = device_id
-                    self._device_cache['timestamp'] = time.time()
-        
-        # アプリ起動を検出
-        if "launch" in task.lower() or "open" in task.lower():
-            if "chrome" in task.lower():
-                self.agent_state.current_app = "com.android.chrome"
-        
-        # 操作履歴に追加
-        operation_summary = f"{task} -> {result[:50]}..."
-        self.agent_state.operation_history.append(operation_summary)
-        
-        # 履歴制限（最新5件まで）
-        if len(self.agent_state.operation_history) > 5:
-            self.agent_state.operation_history = self.agent_state.operation_history[-5:]
-    
-    # メソッドをクラスに追加
-    AndroidBaseAgentTest._build_conversation_with_history = _build_conversation_with_history
-    AndroidBaseAgentTest._update_conversation_history = _update_conversation_history
-    AndroidBaseAgentTest._update_agent_state = _update_agent_state
-
-# 状態管理メソッドを追加
-_add_state_management_methods()
