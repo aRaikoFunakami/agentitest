@@ -85,46 +85,33 @@ class EventPrinter:
                 pass
 
     # --- public handlers ---
-    def on_node_start(self, ev):
-        node = ev.get("data", {}).get("node_name")
-        self._log_and_attach(
-            f"[NODE:START] {node}",
-            "Node Start"
-        )
-
-    def on_node_end(self, ev):
-        node = ev.get("data", {}).get("node_name")
-        self._log_and_attach(
-            f"[NODE:END] {node}",
-            "Node End"
-        )
-
     def on_tool_start(self, ev):
         d = ev.get("data", {})
         name = ev.get("name") or "<tool>"
-        self._log_and_attach(
-            f"[TOOL:START] {name} args={d.get('input')}",
-            "Tool Start"
-        )
+        message = f"{name} args={d.get('input')}"
+        print(Fore.BLUE + f"[TOOL:START] {message}")
+        allure.attach(message, name="Calling Tool", attachment_type=allure.attachment_type.TEXT)
 
     def on_tool_end(self, ev):
         d = ev.get("data", {})
         name = ev.get("name") or "<tool>"
         output_content = d.get('output')
+        
         if hasattr(output_content, 'content'):
             output_display = output_content.content
         else:
             output_display = str(output_content)
-        
-        self._log_and_attach(
-            f"[TOOL:END] {name} output={output_display}",
-            "Tool End"
-        )
+
+        message = f"{name} output={output_display}"
+        print(Fore.BLUE + f"[TOOL:END] {message}")
+        allure.attach(message, name="Tool Result", attachment_type=allure.attachment_type.TEXT)
 
     def _print_on_chat_model_end(self, ev):
         # ev['data']['output'] が AIMessage インスタンス
-        ai_msg = ev['data']['output'].content
-        self._log_and_attach(f"[MODEL:END] {ai_msg}","Model End")
+        message = ev['data']['output'].content
+        print(Fore.BLUE + f"[MODEL:END] {message}")
+        if message and message.strip():
+            allure.attach(message, name="Tought", attachment_type=allure.attachment_type.TEXT)
 
     def _print_on_chain_start(self, ev):
         if self.verbose:
@@ -134,10 +121,11 @@ class EventPrinter:
         data = ev.get('data', {})
         output = data.get('output')
         if ev.get('name') == 'should_continue' and output:
-            message = "[CHAIN:END] should_continue, " + (output if not isinstance(output, list) else str(output[0]))
-            self._log_and_attach(message, "Chain End")
+            message = "should_continue, " + (output if not isinstance(output, list) else str(output[0]))
+            print(Fore.BLUE + f"[CHAIN:END] {message}")
+            allure.attach(message, name="Proceed with the reasoning", attachment_type=allure.attachment_type.TEXT)
         elif self.verbose:
-            self._log_and_attach(f"[CHAIN:END] {ev.get('name')},","Chain End")
+            print(Fore.BLUE + f"[CHAIN:END] {ev.get('name')},")
 
     def dispatch(self, ev):
         et = ev.get("event", "")
