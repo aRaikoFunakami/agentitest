@@ -163,24 +163,27 @@ class AndroidBaseAgentTest:
         """AndroidBaseAgentTestインスタンスの初期化"""
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.agent = None
+        self.tools = None
         self.llm = init_chat_model("openai:gpt-4.1", temperature=0)
-        self._current_device_id: Optional[str] = None
+        self.device_id: Optional[str] = None
         self._current_app_bundle_id: Optional[str] = None
         
         # エージェント状態管理を追加
         self.agent_state = AgentState()
         self.conversation_history: List[Dict[str, str]] = []
     
-    async def setup_mobile_agent(self, device_id: Optional[str] = None):
+    async def setup_mobile_agent(self):
         """モバイルエージェントの初期化とセットアップ
         
         Args:
             device_id: 接続対象のAndroidデバイスID (省略時は自動検出)
         """
+        await self._initialize_mcp_servers()
+        await self._initialize_device_id()
         await self._initialize_react_agent()
     
     
-    async def _initialize_react_agent(self):
+    async def _initialize_mcp_servers(self):
         """MCP クライアントの初期化"""
         self.mcp_client = MultiServerMCPClient({
             "mobile": {
@@ -189,17 +192,90 @@ class AndroidBaseAgentTest:
                 "args": ["-y", "@mobilenext/mobile-mcp@latest"],
             }
         })
+
+    async def _initialize_device_id(self):
+        """デバイスIDの初期化と設定（最初に見つかったデバイスを自動使用）
         
-        mobile_tools = await self.mcp_client.get_tools()
+        指定されたフォーマットからデバイスIDを抽出:
+        - "Android devices: [device1,device2,...]"
+        - "Android TV devices: [device1,device2,...]"
         
+        Returns:
+            str: 設定されたデバイスID
+        """
+        try:
+            # ツールを取得してデバイス一覧を取得
+            if not self.mcp_client:
+                print("MCP client not initialized, using default device ID")
+                self.device_id = "emulator-5554"
+                return "emulator-5554"
+            
+            # ツールを一時的に取得
+            tools = await asyncio.wait_for(
+                self.mcp_client.get_tools(),
+                timeout=10.0
+            )
+            
+            # mobile_list_available_devicesツールを検索
+            list_devices_tool = None
+            for tool in tools:
+                if hasattr(tool, 'name') and tool.name == 'mobile_list_available_devices':
+                    list_devices_tool = tool
+                    break
+            
+            # デバイス一覧を取得
+            devices_result = await asyncio.wait_for(
+                list_devices_tool.ainvoke({"noParams": {}}),
+                timeout=10.0
+            )
+            
+            print(f"Available devices result: {devices_result}")
+            
+            # 結果からデバイスIDを抽出
+            if isinstance(devices_result, str):
+                devices_content = devices_result
+            elif hasattr(devices_result, 'content'):
+                devices_content = devices_result.content
+            else:
+                devices_content = str(devices_result)
+            
+            # 指定フォーマットからデバイスIDを抽出（最初のデバイスを使用）
+            import re
+            # "Android devices: [device1,device2,...]" または "Android TV devices: [device1,device2,...]" を検索
+            pattern = r'Android (?:TV )?devices: \[([^\]]+)\]'
+            match = re.search(pattern, devices_content)
+            
+            if match:
+                devices_list = [d.strip() for d in match.group(1).split(',') if d.strip()]
+                if devices_list:
+                    first_device = devices_list[0]
+                    self.device_id = first_device
+                    print(f"Found and selected first device: {first_device}")
+                    return first_device
+            
+            print("No devices found in expected format, using default device ID")
+            self.device_id = "emulator-5554"
+            return "emulator-5554"
+            
+        except Exception as e:
+            print(f"Failed to initialize device ID: {str(e)}, using default device ID")
+            self.device_id = "emulator-5554"
+            return "emulator-5554"
+
+    async def _initialize_react_agent(self):    
+        self.tools = await self.mcp_client.get_tools()
+    
         # LangGraphエージェントを作成（効率化設定）
         self.agent = create_react_agent(
             self.llm,
-            mobile_tools,
+            self.tools,
             prompt=self._get_mobile_agent_prompt()
             # 注意: create_react_agent()はrecursion_limitやmax_iterationsを引数として受け取らない
             # これらの制限は実行時のconfigで指定する
         )
+        
+        # mobile_agent属性も設定（後方互換性のため）
+        self.mobile_agent = self.agent
     
     def _get_mobile_agent_prompt(self) -> str:
        return """あなたはAndroidデバイス上でアプリケーションを操作するエージェントです。
@@ -226,7 +302,10 @@ class AndroidBaseAgentTest:
             # タスク実行前のスクリーンショット取得
             await self._capture_pre_task_state(task)
 
-            post_task_message = "\nタスクを実行するために必要な操作を計画しなさい。次に計画を１つ１つ実行しなさい。"
+            post_task_message = """\nタスクを実行するために必要な操作を計画しなさい。
+            ツールを使って計画を推進するために計画をブレークダウンしなさい
+            失敗した場合の対処法を考えなさい
+            次に計画に沿って１つ１つ実行しなさい。"""
             inputs = {"messages": [
                 ("user", f"{task}"),
                 ("user", post_task_message)
@@ -383,7 +462,7 @@ class AndroidBaseAgentTest:
                 return
                 
             # device パラメータを使ってスクリーンショットを保存（タイムアウト保護付き）
-            device_id = self._current_device_id or "emulator-5554"
+            device_id = self.device_id or "emulator-5554"
             
             # 一時ファイルパスを生成
             import tempfile
@@ -466,7 +545,7 @@ class AndroidBaseAgentTest:
                         
         except asyncio.TimeoutError:
             allure.attach(
-                f"Screenshot capture timed out after 15 seconds",
+                "Screenshot capture timed out after 15 seconds",
                 name=f"Screenshot Timeout - {context}",
                 attachment_type=allure.attachment_type.TEXT
             )
@@ -518,7 +597,7 @@ class AndroidBaseAgentTest:
                 return
             
             # デバイスIDを使って画面要素を取得（タイムアウト保護付き）
-            device_id = self._current_device_id or "emulator-5554"
+            device_id = self.device_id or "emulator-5554"
             print(f"DEBUG: Invoking accessibility tool with device: {device_id}")
             
             tree_result = await asyncio.wait_for(
@@ -596,7 +675,7 @@ class AndroidBaseAgentTest:
         
         self.mcp_client = None
         self.agent = None
-        self._current_device_id = None
+        self.device_id = None
         self._current_app_bundle_id = None
 
     # AndroidBaseTestのユーティリティメソッドをマージ
